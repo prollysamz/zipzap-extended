@@ -4,18 +4,15 @@ from __future__ import print_function
 
 from tqdm import tqdm
 import pandas as pd
-from sklearn.model_selection import train_test_split
-from vocab import FreqVocab
+from research_protocol import split_accounts, write_json, sha256_file
 import os
 import collections
 import random
-import functools
 # import tensorflow as tf
 import tensorflow.compat.v1 as tf
 tf.disable_v2_behavior()
 
 import numpy as np
-import sys
 import six
 import pickle as pkl
 import time
@@ -33,12 +30,7 @@ flags.DEFINE_string("data_dir", './data/', "data dir.")
 flags.DEFINE_string("dataset_name", 'eth',"dataset name.")
 flags.DEFINE_string("vocab_filename", "vocab", "vocab filename")
 flags.DEFINE_bool("total_drop", False, "whether to drop")
-
-SLIDING_STEP = round(FLAGS.max_seq_length * 0.6)
-
-print("MAX_SEQUENCE_LENGTH:", FLAGS.max_seq_length)
-print("SLIDING_STEP:", SLIDING_STEP)
-
+flags.DEFINE_integer("seed", 12345, "Split and window sampling seed")
 
 class FinetuneInstance(object):
     """A single training instance (sentence pair)."""
@@ -95,18 +87,6 @@ def printable_text(text):
             raise ValueError("Unsupported string type: %s" % (type(text)))
     else:
         raise ValueError("Not running on Python2 or Python 3?")
-
-def cmp_udf_reverse(x1, x2):
-    time1 = int(x1[2])
-    time2 = int(x2[2])
-
-    if time1 < time2:
-        return 1
-    elif time1 > time2:
-        return -1
-    else:
-        return 0
-
 
 def create_embedding_predictions(tokens):
     """Creates the predictions for the masked LM objective."""
@@ -172,10 +152,10 @@ def write_finetune_instance_to_example_files(instances, max_seq_length, vocab, o
         instance = instances[inst_index]
         input_ids = vocab.convert_tokens_to_ids(instance.tokens)
         address = vocab.convert_tokens_to_ids(instance.address)
-        counts = instance.cnts
+        counts = list(instance.cnts)
         block_timestamps = instance.block_timestamps
-        values = instance.cnts
-        io_flags = instance.io_flags
+        values = list(instance.values)
+        io_flags = list(instance.io_flags)
         positions = convert_timestamp_to_position(block_timestamps)
         label = [instance.label]
 
@@ -258,30 +238,13 @@ def total_repeat_drop(eoa2seq):
     return new_eoa2seq
 
 
-def random_drop(eoa2seq, ratio=0.5):
-
-    new_eoa2seq = {}
-    for eoa, seq in eoa2seq.items():
-        filter_num = int(ratio * len(seq))
-
-        if len(seq) <= 2:
-            new_eoa2seq[eoa] = seq
-
-        else:
-            remain_idx = set(np.random.choice(range(len(seq)), len(seq) - filter_num, replace=False))
-            new_seq = []
-
-            for id in remain_idx:
-                new_seq.append(seq[id])
-
-            new_seq = sorted(new_seq, key=functools.cmp_to_key(cmp_udf_reverse))
-            new_eoa2seq[eoa] = new_seq
-
-    return new_eoa2seq
-
-
-
 if __name__ == '__main__':
+
+    rng.seed(FLAGS.seed)
+    np.random.seed(FLAGS.seed)
+    sliding_step = round(FLAGS.max_seq_length * 0.6)
+    print("MAX_SEQUENCE_LENGTH:", FLAGS.max_seq_length)
+    print("SLIDING_STEP:", sliding_step)
 
     # load label
     phisher_account = pd.read_csv("../Data/phisher_account.txt", names=["account"])
@@ -292,7 +255,8 @@ if __name__ == '__main__':
     with open(vocab_file_name, "rb") as f:
         vocab = pkl.load(f)
 
-    with open("./data/eoa2seq.pkl", "rb") as f:
+    source_file = os.path.join(FLAGS.data_dir, "eoa2seq.pkl")
+    with open(source_file, "rb") as f:
         eoa2seq = pkl.load(f)
 
     print("number of target user account:", len(eoa2seq))
@@ -300,13 +264,9 @@ if __name__ == '__main__':
     if FLAGS.total_drop:
         eoa2seq = total_repeat_drop(eoa2seq)
 
-    eoa_list = list(eoa2seq.keys())
-    rng.shuffle(eoa_list)
-    idx = round(len(eoa_list) * 0.7)
-    train_eoa_list = set(eoa_list[:idx])
-    test_eoa_list = set(eoa_list[idx:])
-    print("------------------")
-    print(len(train_eoa_list.intersection(test_eoa_list)))
+    splits = split_accounts(eoa2seq.keys(),
+                            {a: int(a in phisher_account_set) for a in eoa2seq}, FLAGS.seed)
+    account_split = {account: split for split, accounts in splits.items() for account in accounts}
 
     label_list = []
     # clip and add label
@@ -327,7 +287,7 @@ if __name__ == '__main__':
             label_list.append(is_phish(eoa))
 
         elif len(seq) > max_num_tokens:
-            beg_idx = list(range(len(seq) - max_num_tokens, 0, -1 * SLIDING_STEP))
+            beg_idx = list(range(len(seq) - max_num_tokens, 0, -1 * sliding_step))
             beg_idx.append(0)
 
             if len(beg_idx) > 500:
@@ -345,39 +305,26 @@ if __name__ == '__main__':
                     idx += 1
                     label_list.append(is_phish(eoa))
 
-    # split into training and testing sequences
-    train_seqs = []
-    test_seqs = []
-    train_label_list = []
-    test_label_list = []
-    print("Splitting the sequence..")
-    for i in tqdm(range(len(seqs))):
-        seq = seqs[i]
-        label = label_list[i]
-        if seq[0][0] in train_eoa_list:
-            train_seqs.append(seq)
-            train_label_list.append(label)
-        elif seq[0][0] in test_eoa_list:
-            test_seqs.append(seq)
-            test_label_list.append(label)
-
-    print("Generating training samples..")
-    train_phish_instance = gen_finetune_samples(train_seqs, train_label_list)
-    rng.shuffle(train_phish_instance)
-
-    print("Generating testing samples..")
-    test_phish_instance = gen_finetune_samples(test_seqs, test_label_list)
-    rng.shuffle(test_phish_instance)
-
-    print("*** Writing to output files ***")
-    output_filename = FLAGS.data_dir + "finetune_train.tfrecord"
-    print("  %s", output_filename)
-
-    write_finetune_instance_to_example_files(train_phish_instance, FLAGS.max_seq_length, vocab, [output_filename])
-
-    print("*** Writing to output files ***")
-    output_filename = FLAGS.data_dir + "finetune_test.tfrecord"
-    print("  %s", output_filename)
-
-    write_finetune_instance_to_example_files(test_phish_instance, FLAGS.max_seq_length, vocab, [output_filename])
+    grouped = {name: ([], []) for name in splits}
+    for seq, label in zip(seqs, label_list):
+        sequences, labels = grouped[account_split[seq[0][0]]]
+        sequences.append(seq)
+        labels.append(label)
+    manifest = {"seed": FLAGS.seed, "evaluation_setting": "transductive",
+                "split_label_use": "stratified_using_known_phishing_labels",
+                "negative_class": "accounts_without_known_phishing_labels",
+                "vocab_sha256": sha256_file(vocab_file_name),
+                "source_sha256": sha256_file(source_file),
+                "known_phishing_sha256": sha256_file("../Data/phisher_account.txt"),
+                "max_seq_length": FLAGS.max_seq_length, "total_drop": FLAGS.total_drop,
+                "amount_feature": "transaction_amount_bucket", "splits": {}}
+    for name, (sequences, labels) in grouped.items():
+        instances = gen_finetune_samples(sequences, labels)
+        rng.shuffle(instances)
+        output_filename = os.path.join(FLAGS.data_dir, "finetune_" + name + ".tfrecord")
+        write_finetune_instance_to_example_files(instances, FLAGS.max_seq_length, vocab, [output_filename])
+        manifest["splits"][name] = {
+            "account_ids": sorted(vocab.convert_tokens_to_ids(sorted(splits[name]))),
+            "records": len(instances), "sha256": sha256_file(output_filename)}
+    write_json(os.path.join(FLAGS.data_dir, "finetune_splits.json"), manifest)
     print("Finished..")

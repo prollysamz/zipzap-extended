@@ -11,6 +11,7 @@ import math
 import re
 import six
 import numpy as np
+from research_protocol import validate_buckets
 # import tensorflow as tf
 import os
 os.environ['TF_USE_LEGACY_KERAS'] = '1'
@@ -149,6 +150,10 @@ class BertModel(object):
             is invalid.
         """
         config = copy.deepcopy(config)
+        if not getattr(config, "allow_legacy_bucket_gaps", False):
+            validate_buckets(config.bucket_list, config.vocab_size, config.factor_list)
+        if config.factor_list[0] != config.hidden_size:
+            raise ValueError("The first embedding factor must equal hidden_size")
         if not is_training:
             config.hidden_dropout_prob = 0.0
             config.attention_probs_dropout_prob = 0.0
@@ -236,7 +241,7 @@ class BertModel(object):
 
 
     def get_pooled_output(self):
-        return self.pooled_output
+        return self.sequence_output[:, 0, :]
 
     def get_sequence_output(self):
         """Gets final hidden layer of encoder.
@@ -454,6 +459,9 @@ def embedding_lookup(input_ids,
 
 def new_embedding_lookup(input_ids, bucket_list, embedding_table_list, factorize_table_list):
 
+    with tf.control_dependencies([tf.assert_greater_equal(input_ids, 0),
+                                  tf.assert_less(input_ids, bucket_list[-1][1])]):
+        input_ids = tf.identity(input_ids)
     embedding_size = get_shape_list(embedding_table_list[0])[-1]
     output_list = []
     for i in range(len(bucket_list)):

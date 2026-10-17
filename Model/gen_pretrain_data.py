@@ -1,4 +1,5 @@
 import pandas as pd
+import os
 import numpy as np
 import pickle as pkl
 from tqdm import tqdm
@@ -13,40 +14,37 @@ import six
 import time
 import math
 from vocab import FreqVocab
+from research_protocol import sha256_file, write_json
 
 tf.logging.set_verbosity(tf.logging.INFO)
 
 random_seed = 12345
 rng = random.Random(random_seed)
 
-short_seq_prob = 0  # Probability of creating sequences which are shorter than the maximum length。
 flags = tf.flags
 FLAGS = flags.FLAGS
 
-flags.DEFINE_integer("pool_size", 10, "multiprocesses pool size.")
-flags.DEFINE_integer("max_seq_length", 29, "max sequence length.")
-flags.DEFINE_float("masked_lm_prob", 0.8, "Masked LM probability.")
-flags.DEFINE_float("mask_prob", 1.0, "mask probabaility")
-flags.DEFINE_bool("do_eval", False, "")
-flags.DEFINE_bool("do_embed", True, "")
-flags.DEFINE_integer("dupe_factor", 10, "Number of times to duplicate the input data (with different masks).")
+flags.DEFINE_integer("max_seq_length", 100, "Must match downstream sequence length")
+flags.DEFINE_float("masked_lm_prob", 0.15, "Fraction of transaction tokens selected for prediction")
+flags.DEFINE_float("mask_prob", 0.8, "Selected-token probability of [MASK] replacement")
+flags.DEFINE_float("random_token_prob", 0.1, "Selected-token probability of random replacement")
+flags.DEFINE_bool("mask_self_token", False, "Include the account self token in the prediction objective")
+flags.DEFINE_bool("do_eval", False,
+                  "Diagnostic run only: hold out 20% of accounts from pretraining to measure masked-address "
+                  "loss. The resulting encoder never trains on those accounts; use the default (False) "
+                  "to pretrain on all accounts for downstream experiments.")
+flags.DEFINE_bool("do_embed", False, "Write an additional unmasked TFRecord")
+flags.DEFINE_integer("dupe_factor", 1, "Number of independently masked copies per window")
 flags.DEFINE_string("data_dir", './data/', "data dir.")
 flags.DEFINE_string("vocab_filename", "vocab", "vocab filename")
-flags.DEFINE_bool("total_drop", True, "whether to drop")
-flags.DEFINE_bool("drop", False, "whether to drop")
+flags.DEFINE_bool("total_drop", False, "Use the same repeated-transaction preprocessing as downstream")
+flags.DEFINE_integer("seed", 12345, "Masking, shuffle and window sampling seed")
 
 HEADER = 'hash,nonce,block_hash,block_number,transaction_index,from_address,to_address,value,gas,gas_price,input,block_timestamp,max_fee_per_gas,max_priority_fee_per_gas,transaction_type'.split(
     ",")
 
 MaskedLmInstance = collections.namedtuple("MaskedLmInstance",
                                           ["index", "label"])
-
-MAX_PREDICTIONS_PER_SEQ = math.ceil(FLAGS.max_seq_length * FLAGS.masked_lm_prob)
-SLIDING_STEP = round(FLAGS.max_seq_length * 0.6)
-
-print("MAX_SEQUENCE_LENGTH:", FLAGS.max_seq_length)
-print("MAX_PREDICTIONS_PER_SEQ:", MAX_PREDICTIONS_PER_SEQ)
-print("SLIDING_STEP:", SLIDING_STEP)
 
 class TrainingInstance(object):
     """A single training instance (sentence pair)."""
@@ -126,8 +124,8 @@ def gen_samples(sequences,
                 dupe_factor,
                 masked_lm_prob,
                 max_predictions_per_seq,
-                pool_size,
                 rng,
+                vocab_words,
                 force_head=False):
     instances = []
     # create train
@@ -154,7 +152,9 @@ def gen_samples(sequences,
             for tokens in sequences:
                 (address, tokens, masked_lm_positions,
                  masked_lm_labels) = create_masked_lm_predictions(
-                    tokens, masked_lm_prob, max_predictions_per_seq, rng)
+                    tokens, masked_lm_prob, max_predictions_per_seq, rng,
+                    FLAGS.mask_prob, FLAGS.random_token_prob,
+                    FLAGS.mask_self_token, vocab_words=vocab_words)
                 instance = TrainingInstance(
                     address=address,
                     tokens=tokens,
@@ -181,13 +181,17 @@ def create_masked_lm_predictions_force_head(tokens):
 
 
 def create_masked_lm_predictions(tokens, masked_lm_prob,
-                                 max_predictions_per_seq, rng):
+                                 max_predictions_per_seq, rng,
+                                 mask_prob=0.8, random_token_prob=0.1,
+                                 mask_self_token=False, vocab_words=None):
     """Creates the predictions for the masked LM objective."""
 
     address = tokens[0][0]
-    cand_indexes = []
-    for (i, token) in enumerate(tokens):
-        cand_indexes.append(i)
+    if mask_prob < 0 or random_token_prob < 0 or mask_prob + random_token_prob > 1:
+        raise ValueError("Replacement probabilities must be nonnegative and sum to at most one")
+    cand_indexes = list(range(0 if mask_self_token else 1, len(tokens)))
+    if not cand_indexes:
+        raise ValueError("Sequence has no transaction token available for masking")
 
     rng.shuffle(cand_indexes)
     output_tokens = [list(i) for i in tokens]  # note that change the value of output_tokens will also change tokens
@@ -201,9 +205,15 @@ def create_masked_lm_predictions(tokens, masked_lm_prob,
         if index in covered_indexes:
             continue
         covered_indexes.add(index)
-        masked_token = "[MASK]"
         masked_lms.append(MaskedLmInstance(index=index, label=tokens[index][0]))
-        output_tokens[index][0] = masked_token
+        replacement = rng.random()
+        if replacement < mask_prob:
+            output_tokens[index][0] = "[MASK]"
+        elif replacement < mask_prob + random_token_prob:
+            if not vocab_words:
+                raise ValueError("Random replacement requires vocabulary tokens")
+            output_tokens[index][0] = vocab_words[rng.randrange(len(vocab_words))]
+        # Otherwise keep the original token, matching BERT's 80/10/10 policy.
 
     masked_lms = sorted(masked_lms, key=lambda x: x.index)
     masked_lm_positions = []
@@ -382,9 +392,16 @@ def cmp_udf_reverse(x1, x2):
 
 
 def main():
+    rng.seed(FLAGS.seed)
+    np.random.seed(FLAGS.seed)
+    max_predictions_per_seq = math.ceil(FLAGS.max_seq_length * FLAGS.masked_lm_prob)
+    sliding_step = round(FLAGS.max_seq_length * 0.6)
+    print("MAX_SEQUENCE_LENGTH:", FLAGS.max_seq_length)
+    print("MAX_PREDICTIONS_PER_SEQ:", max_predictions_per_seq)
+    print("SLIDING_STEP:", sliding_step)
     vocab = FreqVocab()
     print("===========Load Sequence===========")
-    with open("./data/eoa2seq.pkl", "rb") as f:
+    with open(os.path.join(FLAGS.data_dir, "eoa2seq.pkl"), "rb") as f:
         eoa2seq = pkl.load(f)
 
     print("number of target user account:", len(eoa2seq))
@@ -434,7 +451,7 @@ def main():
             seqs[idx] += seq
             idx += 1
         elif len(seq) > max_num_tokens:
-            beg_idx = list(range(len(seq) - max_num_tokens, 0, -1 * SLIDING_STEP))
+            beg_idx = list(range(len(seq) - max_num_tokens, 0, -1 * sliding_step))
             beg_idx.append(0)
 
             if len(beg_idx) > 500:
@@ -458,41 +475,59 @@ def main():
         tf.logging.info("  %s", output_filename)
 
         write_instance_to_example_files(write_instance, FLAGS.max_seq_length,
-                                        MAX_PREDICTIONS_PER_SEQ, vocab,
+                                        max_predictions_per_seq, vocab,
                                         [output_filename])
 
     rng.shuffle(seqs)
 
-    if FLAGS.do_eval:  # select 20% for testing
-        print("========Generate Evaluation Samples========")
-        eval_seqs = seqs[:round(len(seqs) * 0.2)]
-        seqs = seqs[round(len(seqs) * 0.2):]
+    eval_output_filename = FLAGS.data_dir + "test.tfrecord"
+    if not FLAGS.do_eval:
+        # Remove artifacts of an earlier diagnostic run so a stale holdout cannot be mistaken for this one.
+        for stale in (eval_output_filename, FLAGS.data_dir + "pretrain_split.json"):
+            if os.path.exists(stale):
+                os.remove(stale)
+
+    if FLAGS.do_eval:
+        print("========Generate Diagnostic Holdout (excluded from pretraining)========")
+        accounts = sorted(eoa2seq)
+        rng.shuffle(accounts)
+        eval_accounts = set(accounts[:max(1, round(len(accounts) * 0.2))])
+        eval_seqs = [seq for seq in seqs if seq[0][0] in eval_accounts]
+        seqs = [seq for seq in seqs if seq[0][0] not in eval_accounts]
+        if not eval_seqs or not seqs:
+            raise ValueError("Account-disjoint pretraining evaluation requires at least two accounts")
 
         eval_normal_instances = gen_samples(eval_seqs,
                                             dupe_factor=FLAGS.dupe_factor,
                                             masked_lm_prob=FLAGS.masked_lm_prob,
-                                            max_predictions_per_seq=MAX_PREDICTIONS_PER_SEQ,
-                                            pool_size=FLAGS.pool_size,
+                                            max_predictions_per_seq=max_predictions_per_seq,
                                             rng=rng,
+                                            vocab_words=vocab.vocab_words[3:],
                                             force_head=False)
 
         eval_write_instance = eval_normal_instances
         rng.shuffle(eval_write_instance)
-        eval_output_filename = FLAGS.data_dir + "test.tfrecord"
         tf.logging.info("*** Writing to Testing files ***")
         tf.logging.info("  %s", eval_output_filename)
 
         write_instance_to_example_files(eval_write_instance, FLAGS.max_seq_length,
-                                        MAX_PREDICTIONS_PER_SEQ, vocab,
+                                        max_predictions_per_seq, vocab,
                                         [eval_output_filename])
+        import json
+        with open(FLAGS.data_dir + "pretrain_split.json", "w") as output:
+            json.dump({"seed": FLAGS.seed, "split_unit": "account",
+                       "train_accounts": sorted(vocab.convert_tokens_to_ids(
+                           [account for account in accounts if account not in eval_accounts])),
+                       "validation_accounts": sorted(vocab.convert_tokens_to_ids(eval_accounts)),
+                       "overlapping_accounts": 0}, output, indent=2)
 
     print("========Generate Training Samples========")
     normal_instances = gen_samples(seqs,
                                    dupe_factor=FLAGS.dupe_factor,
                                    masked_lm_prob=FLAGS.masked_lm_prob,
-                                   max_predictions_per_seq=MAX_PREDICTIONS_PER_SEQ,
-                                   pool_size=FLAGS.pool_size,
+                                   max_predictions_per_seq=max_predictions_per_seq,
                                    rng=rng,
+                                   vocab_words=vocab.vocab_words[3:],
                                    force_head=False)
 
     write_instance = normal_instances
@@ -503,8 +538,23 @@ def main():
     tf.logging.info("  %s", output_filename)
 
     write_instance_to_example_files(write_instance, FLAGS.max_seq_length,
-                                    MAX_PREDICTIONS_PER_SEQ, vocab,
+                                    max_predictions_per_seq, vocab,
                                     [output_filename])
+
+    manifest = {
+        "seed": FLAGS.seed, "max_seq_length": FLAGS.max_seq_length,
+        "total_drop": FLAGS.total_drop, "masked_lm_probability": FLAGS.masked_lm_prob,
+        "mask_probability": FLAGS.mask_prob, "random_token_probability": FLAGS.random_token_prob,
+        "mask_self_token": FLAGS.mask_self_token, "dupe_factor": FLAGS.dupe_factor,
+        "train_sha256": sha256_file(output_filename), "vocab_sha256": sha256_file(vocab_file_name),
+        "validation_sha256": sha256_file(eval_output_filename) if FLAGS.do_eval else None,
+        "account_disjoint_validation": FLAGS.do_eval,
+        # A holdout run trains on a strict subset of accounts. Its checkpoints are diagnostics, not
+        # the encoder for downstream experiments.
+        "diagnostic_holdout": FLAGS.do_eval,
+        "train_covers_all_accounts": not FLAGS.do_eval,
+    }
+    write_json(FLAGS.data_dir + "pretrain_manifest.json", manifest)
 
     return
 

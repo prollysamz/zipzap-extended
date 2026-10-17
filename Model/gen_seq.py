@@ -219,7 +219,7 @@ def feature_bucketization(eoa2seq_agg):
                 cnt_bucket = 6
             elif cnt == 7:
                 cnt_bucket = 7
-            elif 8 < cnt <= 10:
+            elif 8 <= cnt <= 10:
                 cnt_bucket = 8
             elif 10 < cnt <= 20:
                 cnt_bucket = 9
@@ -269,6 +269,12 @@ def main():
 
         eoa2seq_agg.update(phisher_eoa2seq_agg)
 
+    tf.gfile.MakeDirs("./data")
+    # Preserve continuous amounts and repetition counts for the behavioural
+    # control before the Transformer-specific bucketization mutates them.
+    with open("./data/eoa2seq_behavioral.pkl", "wb") as f:
+        pkl.dump(eoa2seq_agg, f)
+
     eoa2seq_agg = feature_bucketization(eoa2seq_agg)
 
     print("statistics:")
@@ -281,8 +287,6 @@ def main():
     print("Median:", np.median(length_list))
     print("Mean:", np.mean(length_list))
     print("Seq #:", len(length_list))
-
-    tf.gfile.MakeDirs("./data")
 
     with open("./data/eoa2seq.pkl", "wb") as f:
         pkl.dump(eoa2seq_agg, f)

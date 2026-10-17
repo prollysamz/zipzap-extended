@@ -9,6 +9,8 @@ Model/data/
 # Model checkpoints & weights
 Model/ckpt_dir/
 ckpt_dir/
+ckpt_pretrain/
+ckpt_*/
 *.ckpt*
 *.index
 *.meta
@@ -20,8 +22,12 @@ project_results/
 Model/eval_output.txt
 *.log
 *.txt
+!requirements.txt
+!requirements-dev.txt
 
 # Python cache & temp files
+.venv/
+.pytest_cache/
 __pycache__/
 */__pycache__/
 *.py[cod]
