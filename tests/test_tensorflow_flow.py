@@ -65,7 +65,7 @@ def experiment(tmp_path_factory):
 
 def record_accounts(path):
     return {tf.train.Example.FromString(record).features.feature["address"].int64_list.value[0]
-            for record in tf.io.tf_record_iterator(str(path))}
+            for record in tf.io.tf_record_iterator(str(path), options="GZIP")}
 
 
 def test_default_pretraining_uses_all_accounts_without_holdout(experiment):
@@ -74,6 +74,8 @@ def test_default_pretraining_uses_all_accounts_without_holdout(experiment):
     manifest = json.loads((data / "pretrain_manifest.json").read_text())
     assert manifest["diagnostic_holdout"] is False and manifest["train_covers_all_accounts"] is True
     assert manifest["validation_sha256"] is None
+    assert manifest["tfrecord_compression"] == "GZIP"
+    assert manifest["train_files"] == ["./data/train.tfrecord"]
     assert not (data / "test.tfrecord").exists() and not (data / "pretrain_split.json").exists()
     with open(data / "vocab", "rb") as source:
         vocab = pickle.load(source)

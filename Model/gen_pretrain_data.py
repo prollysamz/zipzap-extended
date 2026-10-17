@@ -1,4 +1,7 @@
 import os
+import glob
+import gzip
+import struct
 import numpy as np
 import pickle as pkl
 from tqdm import tqdm
@@ -11,7 +14,7 @@ tf.disable_v2_behavior()
 import time
 import math
 from vocab import FreqVocab
-from research_protocol import sha256_file, write_json
+from research_protocol import sha256_files, write_json
 
 tf.logging.set_verbosity(tf.logging.INFO)
 
@@ -36,6 +39,8 @@ flags.DEFINE_string("data_dir", './data/', "data dir.")
 flags.DEFINE_string("vocab_filename", "vocab", "vocab filename")
 flags.DEFINE_bool("total_drop", False, "Use the same repeated-transaction preprocessing as downstream")
 flags.DEFINE_integer("seed", 12345, "Masking, shuffle and window sampling seed")
+flags.DEFINE_integer("records_per_shard", 25000,
+                     "Maximum records in one TFRecord shard; avoids large-file corruption on Windows")
 
 MaskedLmInstance = collections.namedtuple("MaskedLmInstance",
                                           ["index", "label"])
@@ -74,6 +79,53 @@ def create_float_feature(values):
     feature = tf.train.Feature(
         float_list=tf.train.FloatList(value=list(values)))
     return feature
+
+
+def shard_paths(output_file, records, records_per_shard):
+    if records_per_shard < 1:
+        raise ValueError("records_per_shard must be positive")
+    shard_count = max(1, math.ceil(records / records_per_shard))
+    if shard_count == 1:
+        return [output_file]
+    stem, extension = os.path.splitext(output_file)
+    return ["%s-%05d-of-%05d%s" % (stem, index, shard_count, extension)
+            for index in range(shard_count)]
+
+
+def _crc32c_table():
+    table = []
+    for value in range(256):
+        crc = value
+        for _ in range(8):
+            crc = (crc >> 1) ^ (0x82F63B78 if crc & 1 else 0)
+        table.append(crc & 0xffffffff)
+    return table
+
+
+CRC32C_TABLE = _crc32c_table()
+
+
+def masked_crc32c(value):
+    crc = 0xffffffff
+    for byte in value:
+        crc = CRC32C_TABLE[(crc ^ byte) & 0xff] ^ (crc >> 8)
+    crc = (~crc) & 0xffffffff
+    return (((crc >> 15) | (crc << 17)) + 0xA282EAD8) & 0xffffffff
+
+
+def write_tfrecord_record(stream, serialized):
+    length = struct.pack("<Q", len(serialized))
+    stream.write(length)
+    stream.write(struct.pack("<I", masked_crc32c(length)))
+    stream.write(serialized)
+    stream.write(struct.pack("<I", masked_crc32c(serialized)))
+
+
+def remove_stale_shards(output_file, output_files):
+    stem, extension = os.path.splitext(output_file)
+    for stale in glob.glob(stem + "*" + extension):
+        if stale not in output_files:
+            os.remove(stale)
 
 
 def gen_samples(sequences,
@@ -191,8 +243,9 @@ def write_instance_to_example_files(instances, max_seq_length,
                                     output_files):
     """Create TF example files from `TrainingInstance`s."""
     writers = []
+    records_by_file = [0] * len(output_files)
     for output_file in output_files:
-        writers.append(tf.python_io.TFRecordWriter(output_file))
+        writers.append(gzip.open(output_file, "wb"))
 
     writer_index = 0
     total_written = 0
@@ -252,7 +305,8 @@ def write_instance_to_example_files(instances, max_seq_length,
         tf_example = tf.train.Example(
             features=tf.train.Features(feature=features))
 
-        writers[writer_index].write(tf_example.SerializeToString())
+        write_tfrecord_record(writers[writer_index], tf_example.SerializeToString())
+        records_by_file[writer_index] += 1
         writer_index = (writer_index + 1) % len(writers)
 
         total_written += 1
@@ -274,6 +328,14 @@ def write_instance_to_example_files(instances, max_seq_length,
 
     for writer in writers:
         writer.close()
+
+    for output_file, expected_records in zip(output_files, records_by_file):
+        try:
+            records = sum(1 for _ in tf.io.tf_record_iterator(output_file, options="GZIP"))
+        except tf.errors.DataLossError as error:
+            raise ValueError("Generated corrupt TFRecord: " + output_file) from error
+        if records != expected_records:
+            raise ValueError("Unexpected TFRecord record count: " + output_file)
 
     tf.logging.info("Wrote %d total instances", total_written)
 
@@ -380,9 +442,10 @@ def main():
         tf.logging.info("*** Writing to output embedding files ***")
         tf.logging.info("  %s", output_filename)
 
+        embed_files = shard_paths(output_filename, len(write_instance), FLAGS.records_per_shard)
+        remove_stale_shards(output_filename, embed_files)
         write_instance_to_example_files(write_instance, FLAGS.max_seq_length,
-                                        max_predictions_per_seq, vocab,
-                                        [output_filename])
+                                        max_predictions_per_seq, vocab, embed_files)
 
     rng.shuffle(seqs)
 
@@ -415,9 +478,10 @@ def main():
         tf.logging.info("*** Writing to Testing files ***")
         tf.logging.info("  %s", eval_output_filename)
 
+        eval_files = shard_paths(eval_output_filename, len(eval_write_instance), FLAGS.records_per_shard)
+        remove_stale_shards(eval_output_filename, eval_files)
         write_instance_to_example_files(eval_write_instance, FLAGS.max_seq_length,
-                                        max_predictions_per_seq, vocab,
-                                        [eval_output_filename])
+                                        max_predictions_per_seq, vocab, eval_files)
         import json
         with open(FLAGS.data_dir + "pretrain_split.json", "w") as output:
             json.dump({"seed": FLAGS.seed, "split_unit": "account",
@@ -441,17 +505,20 @@ def main():
     tf.logging.info("*** Writing to Training files ***")
     tf.logging.info("  %s", output_filename)
 
+    train_files = shard_paths(output_filename, len(write_instance), FLAGS.records_per_shard)
+    remove_stale_shards(output_filename, train_files)
     write_instance_to_example_files(write_instance, FLAGS.max_seq_length,
-                                    max_predictions_per_seq, vocab,
-                                    [output_filename])
+                                    max_predictions_per_seq, vocab, train_files)
 
     manifest = {
         "seed": FLAGS.seed, "max_seq_length": FLAGS.max_seq_length,
         "total_drop": FLAGS.total_drop, "masked_lm_probability": FLAGS.masked_lm_prob,
         "mask_probability": FLAGS.mask_prob, "random_token_probability": FLAGS.random_token_prob,
         "mask_self_token": FLAGS.mask_self_token, "dupe_factor": FLAGS.dupe_factor,
-        "train_sha256": sha256_file(output_filename), "vocab_sha256": sha256_file(vocab_file_name),
-        "validation_sha256": sha256_file(eval_output_filename) if FLAGS.do_eval else None,
+        "tfrecord_compression": "GZIP",
+        "train_sha256": sha256_files(train_files), "train_files": train_files,
+        "vocab_sha256": sha256_files([vocab_file_name]),
+        "validation_sha256": sha256_files(eval_files) if FLAGS.do_eval else None,
         "account_disjoint_validation": FLAGS.do_eval,
         # A holdout run trains on a strict subset of accounts. Its checkpoints are diagnostics, not
         # the encoder for downstream experiments.

@@ -91,8 +91,9 @@ def convert_timestamp_to_position(block_timestamps):
 def write_finetune_instance_to_example_files(instances, max_seq_length, vocab, output_files):
     """Create TF example files from `TrainingInstance`s."""
     writers = []
+    records_by_file = [0] * len(output_files)
     for output_file in output_files:
-        writers.append(tf.python_io.TFRecordWriter(output_file))
+        writers.append(tf.io.TFRecordWriter(output_file))
 
     writer_index = 0
     total_written = 0
@@ -143,6 +144,7 @@ def write_finetune_instance_to_example_files(instances, max_seq_length, vocab, o
             features=tf.train.Features(feature=features))
 
         writers[writer_index].write(tf_example.SerializeToString())
+        records_by_file[writer_index] += 1
         writer_index = (writer_index + 1) % len(writers)
 
         total_written += 1
@@ -164,6 +166,14 @@ def write_finetune_instance_to_example_files(instances, max_seq_length, vocab, o
 
     for writer in writers:
         writer.close()
+
+    for output_file, expected_records in zip(output_files, records_by_file):
+        try:
+            records = sum(1 for _ in tf.io.tf_record_iterator(output_file))
+        except tf.errors.DataLossError as error:
+            raise ValueError("Generated corrupt TFRecord: " + output_file) from error
+        if records != expected_records:
+            raise ValueError("Unexpected TFRecord record count: " + output_file)
 
     tf.logging.info("Wrote %d total instances", total_written)
 

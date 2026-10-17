@@ -12,6 +12,18 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
+def sha256_files(paths):
+    """Hash one file compatibly, or an ordered set of files as one input contract."""
+    paths = [Path(path) for path in paths]
+    if len(paths) == 1:
+        return sha256_file(paths[0])
+    digest = hashlib.sha256()
+    for path in paths:
+        digest.update(path.name.encode("utf-8"))
+        digest.update(sha256_file(path).encode("ascii"))
+    return digest.hexdigest()
+
+
 def write_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

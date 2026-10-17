@@ -4,6 +4,7 @@ import json
 import os
 import pickle
 import time
+import glob
 from pathlib import Path
 
 os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
@@ -11,7 +12,17 @@ import numpy as np
 import tensorflow.compat.v1 as tf
 
 import modeling
-from research_protocol import read_provenance, sha256_file, validate_split_accounts, write_json
+from research_protocol import read_provenance, sha256_file, sha256_files, validate_split_accounts, write_json
+
+
+def resolve_input_files(specification):
+    files = []
+    for item in specification.split(","):
+        matches = sorted(glob.glob(item))
+        files.extend(matches if matches else [item])
+    if not files or not all(os.path.isfile(path) for path in files):
+        raise ValueError("Embedding input does not resolve to existing TFRecord files: " + specification)
+    return files
 
 
 def parse_args():
@@ -53,7 +64,7 @@ def labelled_contract(args):
     if manifest["vocab_sha256"] != sha256_file(args.vocab):
         raise ValueError("Split manifest uses a different vocabulary")
     split = manifest["splits"][args.split]
-    if split["sha256"] != sha256_file(args.input_file):
+    if split["sha256"] != sha256_files(resolve_input_files(args.input_file)):
         raise ValueError("Input TFRecord does not match the selected split")
     return (manifest, split), manifest["max_seq_length"]
 
@@ -86,7 +97,9 @@ def main():
     labelled = contract is not None
     if labelled:
         schema["label"] = tf.FixedLenFeature([1], tf.float32)
-    dataset = tf.data.TFRecordDataset(args.input_file).map(lambda r: tf.parse_single_example(r, schema))
+    dataset = tf.data.TFRecordDataset(resolve_input_files(args.input_file),
+                                      compression_type=None if labelled else "GZIP").map(
+        lambda r: tf.parse_single_example(r, schema))
     features = dataset.batch(args.batch_size).make_one_shot_iterator().get_next()
     integers = {name: tf.cast(value, tf.int32) for name, value in features.items() if name != "label"}
     model = modeling.BertModel(
@@ -154,7 +167,8 @@ def main():
         "encoder_label_independent": eligible, "diagnostic_holdout_checkpoint": diagnostic,
         "input_labelled": labelled, "labels_read": labelled, "pooling": args.pooling,
         "window_aggregation": "transaction_count_weighted_mean", "l2_normalized": args.l2_normalize,
-        "input_sha256": sha256_file(args.input_file), "output_sha256": sha256_file(output),
+        "input_sha256": sha256_files(resolve_input_files(args.input_file)),
+        "output_sha256": sha256_file(output),
         "records": records, "accounts": len(ids), "max_seq_length": length,
         "extraction_seconds": time.perf_counter() - start,
     }

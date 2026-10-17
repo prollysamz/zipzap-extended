@@ -18,6 +18,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 import os
+import glob
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import sys
 
@@ -36,7 +37,7 @@ import pickle as pkl
 from timeit import default_timer as timer
 import math
 import json
-from research_protocol import save_provenance, sha256_file, read_provenance
+from research_protocol import save_provenance, sha256_file, sha256_files, read_provenance
 
 flags = tf.flags
 FLAGS = flags.FLAGS
@@ -51,7 +52,7 @@ flags.DEFINE_string(
     "This specifies the model architecture.")
 
 flags.DEFINE_string(
-    "train_input_file", "./data/train.tfrecord",
+    "train_input_file", "./data/train*.tfrecord",
     "Input TF example files (can be a glob or comma separated).")
 
 flags.DEFINE_string(
@@ -88,6 +89,16 @@ print("MAX_SEQUENCE_LENGTH:", FLAGS.max_seq_length)
 print("MAX_PREDICTIONS_PER_SEQ:", MAX_PREDICTIONS_PER_SEQ)
 
 
+def resolve_input_files(specification):
+    files = []
+    for item in specification.split(","):
+        matches = sorted(glob.glob(item))
+        files.extend(matches if matches else [item])
+    if not files or not all(os.path.isfile(path) for path in files):
+        raise ValueError("Pretraining input does not resolve to existing TFRecord files: " + specification)
+    return files
+
+
 def input_fn(input_files,
              is_training,
              num_cpu_threads=4):
@@ -116,12 +127,13 @@ def input_fn(input_files,
             tf.FixedLenFeature([MAX_PREDICTIONS_PER_SEQ], tf.float32)
     }
 
+    input_files = resolve_input_files(input_files)
     if is_training:
-        d = tf.data.TFRecordDataset(input_files)
+        d = tf.data.TFRecordDataset(input_files, compression_type="GZIP")
         d = d.repeat(FLAGS.epoch).shuffle(100, seed=FLAGS.seed)
 
     else:
-        d = tf.data.TFRecordDataset(input_files)
+        d = tf.data.TFRecordDataset(input_files, compression_type="GZIP")
 
     d = d.map(lambda record: _decode_record(record, name_to_features), num_parallel_calls=num_cpu_threads)
     d = d.batch(batch_size=FLAGS.batch_size)
@@ -366,14 +378,9 @@ def main(_):
     if FLAGS.do_train:
         mode = "train"
         input_files = FLAGS.train_input_file
-        # load data
-        features = input_fn(input_files, is_training=True)
-
     elif FLAGS.do_eval:
         mode = "eval"
         input_files = FLAGS.test_input_file
-        features = input_fn(input_files, is_training=False)
-
     else:
         raise ValueError("Only TRAIN and EVAL modes are supported.")
 
@@ -391,7 +398,7 @@ def main(_):
     if expected_hash is None:
         raise ValueError("No diagnostic holdout exists in this pretraining data. "
                          "Regenerate it with gen_pretrain_data.py --do_eval=True (diagnostic runs only).")
-    if expected_hash != sha256_file(input_files):
+    if expected_hash != sha256_files(resolve_input_files(input_files)):
         raise ValueError("Pretraining TFRecord does not match its manifest")
     if data_manifest["max_seq_length"] != FLAGS.max_seq_length:
         raise ValueError("Pretraining sequence length differs from its data manifest")
@@ -402,6 +409,11 @@ def main(_):
         if parent.get("verified") and (parent["config_sha256"] != sha256_file(FLAGS.bert_config_file)
                                       or parent["vocab_sha256"] != sha256_file(vocab_file_name)):
             raise ValueError("Initial checkpoint config or vocabulary mismatch")
+
+    # Validate the protocol and input contract before constructing a dataset, so a
+    # diagnostic-only evaluation request reports its actual error even when the
+    # holdout file was never generated.
+    features = input_fn(input_files, is_training=FLAGS.do_train)
 
     def save_checkpoint(sess, saver, step):
         if step <= 0:
@@ -424,7 +436,7 @@ def main(_):
                         sampled_softmax_log_q_correction=True,
                         accidental_hits_removed=True,
                         position_specific_output_bias=False,
-                        training_input_sha256=sha256_file(FLAGS.train_input_file))
+                        training_input_sha256=sha256_files(resolve_input_files(FLAGS.train_input_file)))
 
     if FLAGS.do_train:
         bert_model, train_op, total_loss = model_fn(features, mode, bert_config, vocab, FLAGS.init_checkpoint,

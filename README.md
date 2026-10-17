@@ -25,20 +25,20 @@ Place the raw dataset in `Data/` and run commands from `Model/`. The raw filenam
 
 ```bash
 cd Model
-python gen_seq.py --dataset=10M --phisher=False
+python gen_seq.py --dataset=1M --phisher=False
 python gen_pretrain_data.py --do_embed=True --seed=12345
 python partitioning.py --vocab=data/vocab --config=zipzap_config.json --output-config=data/zipzap_config.json
 python run_pretrain.py --bert_config_file=data/zipzap_config.json --checkpointDir=ckpt_pretrain --seed=12345
 ```
 
-This is the primary unsupervised workflow: it excludes the phishing transaction files, never opens `phisher_account.txt`, and fits only the masked-address objective. `data/embed.tfrecord` is unmasked and label-free. Export its account embeddings and fit an anomaly detector without labels:
+This is the primary unsupervised workflow: it excludes the phishing transaction files, never opens `phisher_account.txt`, and fits only the masked-address objective. The generator writes unmasked, label-free gzip TFRecord shards such as `data/embed-00000-of-00014.tfrecord`. Export their account embeddings and fit an anomaly detector without labels:
 
 ```bash
-python extract_embeddings.py --checkpoint=ckpt_pretrain/model_STEP --config=data/zipzap_config.json --input-file=data/embed.tfrecord --output=project_results/unlabelled_embeddings.npz
+python extract_embeddings.py --checkpoint=ckpt_pretrain/model_STEP --config=data/zipzap_config.json --input-file='data/embed-*.tfrecord' --output=project_results/unlabelled_embeddings.npz
 python anomaly_detection.py --train=project_results/unlabelled_embeddings.npz --method=isolation_forest --output-dir=project_results/isolation_forest
 ```
 
-The detector scores the same all-account corpus by default and chooses its alert threshold from the training-score percentile. It does not read or write labels. Use a separate, explicitly reported evaluation experiment only when you deliberately create labelled account splits.
+The official archive currently provides the paper's 1M normal-transaction slice, so the command uses `--dataset=1M`. Use `--dataset=10M` only when the corresponding 10M slice files are available. The detector scores the same all-account corpus by default and chooses its alert threshold from the training-score percentile. It does not read or write labels. Use a separate, explicitly reported evaluation experiment only when you deliberately create labelled account splits.
 
 The fine-tuning generator creates a stratified 70/15/15 account split **before assigning windows** and writes:
 
