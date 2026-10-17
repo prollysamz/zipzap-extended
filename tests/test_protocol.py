@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 from evaluation import aggregate_accounts, evaluate, select_f1_threshold
 from partitioning import frequency_buckets
-from anomaly_detection import fit_detector, preprocessing
+from anomaly_detection import fit_detector, load_dataset, preprocessing
 from research_protocol import (read_provenance, save_provenance, split_accounts,
                                validate_buckets, validate_split_accounts)
 
@@ -103,8 +103,18 @@ def test_anomaly_detectors_produce_finite_account_scores(method):
     values = rng.normal(size=(60, 6))
     transform = preprocessing(4, True).fit(values)
     transformed = transform.transform(values)
-    model, score = fit_detector(method, transformed, seed=4, contamination=0.1,
-                                clusters=3, hidden_size=3)
+    model, score = fit_detector(method, transformed, seed=4, clusters=3, hidden_size=3)
     result = score(transformed)
     assert result.shape == (60,)
     assert np.isfinite(result).all()
+
+
+def test_unlabelled_representations_are_loaded_without_reading_labels(tmp_path):
+    path = tmp_path / "representations.npz"
+    np.savez_compressed(path, account_ids=[2, 1], embeddings=[[2.0], [1.0]])
+    ids, values, labels = load_dataset(path)
+    assert ids.tolist() == [1, 2]
+    assert values.tolist() == [[1.0], [2.0]]
+    assert labels is None
+    with pytest.raises(ValueError, match="requires labels"):
+        load_dataset(path, require_labels=True)

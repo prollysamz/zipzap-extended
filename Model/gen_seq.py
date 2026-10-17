@@ -1,9 +1,6 @@
 import numpy as np
-import pandas as pd
 import pickle as pkl
-import functools
 import os
-from vocab import FreqVocab
 import tensorflow.compat.v1 as tf
 tf.disable_v2_behavior()
 
@@ -15,29 +12,6 @@ flags.DEFINE_string("data_dir", "../Data", "data directory.")
 flags.DEFINE_string("dataset", "1M", "which dataset to use")
 flags.DEFINE_bool("dup", True, "whether to do transaction duplication")
 
-
-HEADER = 'hash,nonce,block_hash,block_number,transaction_index,from_address,to_address,value,gas,gas_price,input,block_timestamp,max_fee_per_gas,max_priority_fee_per_gas,transaction_type'.split(",")
-
-def cmp_udf(x1, x2):
-    time1 = int(x1[2])
-    time2 = int(x2[2])
-    if time1 < time2:
-        return -1
-    elif time1 > time2:
-        return 1
-    else:
-        return 0
-
-def cmp_udf_reverse(x1, x2):
-    time1 = int(x1[2])
-    time2 = int(x2[2])
-
-    if time1 < time2:
-        return 1
-    elif time1 > time2:
-        return -1
-    else:
-        return 0
 
 def load_data(f_in, f_out):
     eoa2seq_out = {}
@@ -90,7 +64,7 @@ def seq_duplicate(eoa2seq_in, eoa2seq_out):
     for eoa in eoa2seq_in.keys():
         if len(eoa2seq_in[eoa]) >= 10000:
             continue
-        seq_sorted = sorted(eoa2seq_in[eoa], key=functools.cmp_to_key(cmp_udf))
+        seq_sorted = sorted(eoa2seq_in[eoa], key=lambda transaction: int(transaction[2]))
         seq_tmp = [e.copy() for e in seq_sorted]
         for i in range(len(seq_tmp) - 1, 0, -1):
             l_acc = seq_tmp[i][0]  # latter
@@ -110,7 +84,7 @@ def seq_duplicate(eoa2seq_in, eoa2seq_out):
     for eoa in eoa2seq_out.keys():
         if len(eoa2seq_out[eoa])>=10000:
             continue
-        seq_sorted = sorted(eoa2seq_out[eoa], key=functools.cmp_to_key(cmp_udf))
+        seq_sorted = sorted(eoa2seq_out[eoa], key=lambda transaction: int(transaction[2]))
         seq_tmp = [e.copy() for e in seq_sorted]
         for i in range(len(seq_tmp) - 1, 0, -1):
             l_acc = seq_tmp[i][0]  # latter
@@ -136,7 +110,7 @@ def seq_duplicate(eoa2seq_in, eoa2seq_out):
         except:
             in_seq = []
 
-        seq_agg = sorted(out_seq + in_seq, key=functools.cmp_to_key(cmp_udf_reverse))
+        seq_agg = sorted(out_seq + in_seq, key=lambda transaction: int(transaction[2]), reverse=True)
         cnt_all = 0
         for trans in seq_agg:
             cnt_all += trans[5]
@@ -157,7 +131,7 @@ def seq_generation(eoa2seq_in, eoa2seq_out):
             in_seq = eoa2seq_in[eoa]
         except:
             in_seq = []
-        seq_agg = sorted(out_seq + in_seq, key=functools.cmp_to_key(cmp_udf_reverse))
+        seq_agg = sorted(out_seq + in_seq, key=lambda transaction: int(transaction[2]), reverse=True)
         cnt_all = 0
         for trans in seq_agg:
             cnt_all += 1
@@ -291,8 +265,6 @@ def main():
     with open("./data/eoa2seq.pkl", "wb") as f:
         pkl.dump(eoa2seq_agg, f)
 
-
-print("pause")
 
 if __name__ == '__main__':
     main()

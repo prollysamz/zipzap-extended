@@ -21,14 +21,24 @@ The TensorFlow flow tests use a tiny synthetic dataset, run actual pretraining a
 
 ## Data and configurations
 
-Place the raw dataset in `Data/` and run commands from `Model/`. The raw filenames expected by `gen_seq.py` remain unchanged. Place the known phishing address list at `Data/phisher_account.txt`.
+Place the raw dataset in `Data/` and run commands from `Model/`. The raw filenames expected by `gen_seq.py` remain unchanged. The paper authors publish the archive from their [official ZipZap repository](https://github.com/git-disl/ZipZap); its `Data/` directory includes a phishing address list, but the label-free workflow below never reads it.
 
 ```bash
 cd Model
-python gen_seq.py --dataset=10M
-python gen_pretrain_data.py --seed=12345
-python gen_finetune_data.py --seed=12345
+python gen_seq.py --dataset=10M --phisher=False
+python gen_pretrain_data.py --do_embed=True --seed=12345
+python partitioning.py --vocab=data/vocab --config=zipzap_config.json --output-config=data/zipzap_config.json
+python run_pretrain.py --bert_config_file=data/zipzap_config.json --checkpointDir=ckpt_pretrain --seed=12345
 ```
+
+This is the primary unsupervised workflow: it excludes the phishing transaction files, never opens `phisher_account.txt`, and fits only the masked-address objective. `data/embed.tfrecord` is unmasked and label-free. Export its account embeddings and fit an anomaly detector without labels:
+
+```bash
+python extract_embeddings.py --checkpoint=ckpt_pretrain/model_STEP --config=data/zipzap_config.json --input-file=data/embed.tfrecord --output=project_results/unlabelled_embeddings.npz
+python anomaly_detection.py --train=project_results/unlabelled_embeddings.npz --method=isolation_forest --output-dir=project_results/isolation_forest
+```
+
+The detector scores the same all-account corpus by default and chooses its alert threshold from the training-score percentile. It does not read or write labels. Use a separate, explicitly reported evaluation experiment only when you deliberately create labelled account splits.
 
 The fine-tuning generator creates a stratified 70/15/15 account split **before assigning windows** and writes:
 
@@ -41,7 +51,7 @@ Stratification uses known phishing labels. It must be disclosed as label-informe
 
 `zipzap_config.json` uses corrected contiguous half-open embedding buckets. **Its embedding table shapes differ from historical checkpoints.** Use it for new training. `zipzap_config.legacy.json` preserves the original ranges and explicitly permits their gaps for historical evaluation only. Do not load old weights with the corrected configuration or compare corrected runs as though they reproduce the old preprocessing.
 
-Vocabulary IDs depend on the actual dataset. Check their maximum against the configuration. For a different vocabulary, run `python partitioning.py --vocab=data/vocab`, update `bucket_list` and `vocab_size` together, and retrain. The final upper bound is exclusive and `vocab_size` must exceed the maximum ID. Keep one factor dimension per bucket and the first factor dimension equal to `hidden_size` for this architecture.
+Vocabulary IDs depend on the actual dataset. Generate a matching configuration with `python partitioning.py --vocab=data/vocab --config=zipzap_config.json --output-config=data/zipzap_config.json`, then pass that output to training and extraction. The final upper bound is exclusive and `vocab_size` exceeds the maximum ID. Keep one factor dimension per bucket and the first factor dimension equal to `hidden_size` for this architecture.
 
 Pretraining and downstream generation now both default to 100-token windows with repeat dropping disabled. This trains every learned position used downstream and keeps the sequence policy aligned. Both manifests record those settings, and checkpoint loading rejects a mismatch. `gen_seq.py` still aggregates repeated counterparties into three-day groups before bucketization. It saves a pre-bucket copy for the behavioural control, but this is already aggregated data and must not be described as untouched raw transactions.
 
@@ -117,12 +127,12 @@ python extract_behavioral_features.py --output-dir=project_results/behavioral_fe
 python supervised_feature_baseline.py --train=project_results/behavioral_features/train.npz --validation=project_results/behavioral_features/validation.npz --test=project_results/behavioral_features/test.npz --output-dir=project_results/behavioral
 ```
 
-Run an actual anomaly detector on the three embedding exports:
+Run an actual anomaly detector without labels on the unlabelled export:
 
 ```bash
-python anomaly_detection.py --train=project_results/train_embeddings.npz --validation=project_results/validation_embeddings.npz --test=project_results/test_embeddings.npz --method=isolation_forest --output-dir=project_results/isolation_forest
+python anomaly_detection.py --train=project_results/unlabelled_embeddings.npz --method=isolation_forest --output-dir=project_results/isolation_forest
 ```
 
-`--method` also accepts `kmeans` and `autoencoder`. Scaling, optional PCA, and optional L2 normalization are fitted on training vectors only. Mixed-unlabelled fitting ignores training labels. `--setting=one_class` selects accounts without known phishing labels using labels and records that use explicitly. The default train-percentile threshold does not use validation labels; `--threshold=validation_f1` is a separately recorded calibrated experiment.
+`--method` also accepts `kmeans` and `autoencoder`. Scaling, optional PCA, and optional L2 normalization are fitted on training vectors only. The default mixed-unlabelled mode and percentile threshold do not load labels. `--setting=one_class`, `--threshold=validation_f1`, and `--test` deliberately consume labelled exports and are separately recorded evaluation modes.
 
 The benchmark is positive-unlabelled: class 0 means “no known phishing label,” not verified legitimate. Accordingly, reported false positives are flags among accounts without known labels, and must not be presented as proven false accusations. Future claims still require repeated seeds, contamination sensitivity, and a temporal or unseen-account protocol with an unknown-address policy.

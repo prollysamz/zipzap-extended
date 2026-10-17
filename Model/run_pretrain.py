@@ -62,8 +62,6 @@ flags.DEFINE_string(
     "checkpointDir", "ckpt_dir",
     "The output directory where the model checkpoints will be written.")
 
-flags.DEFINE_string("signature", 'default', "signature_name")
-
 ## Other parameters
 flags.DEFINE_string("init_checkpoint", None, "Initial checkpoint (usually from a pre-trained BERT model).")
 flags.DEFINE_integer("max_seq_length", 100, "Must match downstream sequence length")
@@ -76,14 +74,10 @@ flags.DEFINE_float("learning_rate", 1e-4, "")
 flags.DEFINE_integer("num_train_steps", 10000000, "Number of training steps.")
 flags.DEFINE_integer("num_warmup_steps", 100, "Number of warmup steps.")
 flags.DEFINE_integer("save_checkpoints_steps", 8000, "")
-flags.DEFINE_integer("iterations_per_loop", 2000, "How many steps to make in each estimator call.")
-flags.DEFINE_integer("max_eval_steps", 1000, "Maximum number of eval steps.")
 flags.DEFINE_integer("neg_sample_num", 512, "The number of negative samples in a batch")
 flags.DEFINE_string("neg_strategy", "zip", "Strategy of negative sampling")
-flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
 flags.DEFINE_string("data_dir", './data/', "data dir.")
 flags.DEFINE_bool("cross_share", True, "whether to share or not")
-flags.DEFINE_bool("load_cross", False, "whether to load from cross")
 flags.DEFINE_string("vocab_filename", "vocab", "vocab filename")
 flags.DEFINE_string("pretrain_manifest", "./data/pretrain_manifest.json", "Pretraining data contract")
 flags.DEFINE_integer("seed", 12345, "NumPy, TensorFlow and shuffle seed")
@@ -139,7 +133,7 @@ def input_fn(input_files,
 
 
 def model_fn(features, mode, bert_config, vocab, init_checkpoint, learning_rate,
-             num_train_steps, num_warmup_steps, use_tpu, use_one_hot_embeddings):
+             num_train_steps, num_warmup_steps, use_one_hot_embeddings):
     """The `model_fn` for TPUEstimator."""
 
     # tf.logging.info("*** Features ***")
@@ -188,7 +182,6 @@ def model_fn(features, mode, bert_config, vocab, init_checkpoint, learning_rate,
     total_loss = masked_lm_loss
     tvars = tf.trainable_variables()
     initialized_variable_names = {}
-    scaffold_fn = None
 
     if init_checkpoint:
         (assignment_map, initialized_variable_names
@@ -198,16 +191,7 @@ def model_fn(features, mode, bert_config, vocab, init_checkpoint, learning_rate,
                            if var.name.startswith("bert/") and var.name not in initialized_variable_names]
         if missing_encoder:
             raise ValueError("Checkpoint did not initialize encoder variables: " + str(missing_encoder[:5]))
-        if use_tpu:
-
-            def tpu_scaffold():
-                tf.train.init_from_checkpoint(init_checkpoint,
-                                              assignment_map)
-                return tf.train.Scaffold()
-
-            scaffold_fn = tpu_scaffold
-        else:
-            tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
+        tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
 
     tf.logging.info("**** Trainable Variables ****")
     for var in tvars:
@@ -220,7 +204,7 @@ def model_fn(features, mode, bert_config, vocab, init_checkpoint, learning_rate,
     if mode == "train":
         train_op = optimization.create_optimizer(total_loss, learning_rate,
                                                  num_train_steps,
-                                                 num_warmup_steps, use_tpu)
+                                                 num_warmup_steps, False)
 
         return model, train_op, total_loss
         # output_spec = tf.estimator.EstimatorSpec(
@@ -236,54 +220,6 @@ def model_fn(features, mode, bert_config, vocab, init_checkpoint, learning_rate,
 
     else:
         raise ValueError("Only TRAIN and EVAL modes are supported: %s" % (mode))
-
-
-def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
-                         label_ids, label_weights):
-    """Get loss and log probs for the masked LM."""
-    # [batch_size*label_size, dim]
-    input_tensor = gather_indexes(input_tensor, positions)
-
-    with tf.variable_scope("cls/predictions"):
-        # We apply one more non-linear transformation before the output layer.
-        # This matrix is not used after pre-training.
-        with tf.variable_scope("transform"):
-            input_tensor = tf.layers.dense(
-                input_tensor,
-                units=bert_config.hidden_size,
-                activation=modeling.get_activation(bert_config.hidden_act),
-                kernel_initializer=modeling.create_initializer(
-                    bert_config.initializer_range))
-            input_tensor = modeling.layer_norm(input_tensor)
-
-        # The output weights are the same as the input embeddings, but there is
-        # an output-only bias for each token.
-        output_bias = tf.get_variable(
-            "output_bias",
-            shape=[output_weights.shape[0]],
-            initializer=tf.zeros_initializer())
-        logits = tf.matmul(input_tensor, output_weights, transpose_b=True)
-        logits = tf.nn.bias_add(logits, output_bias)
-        # logits, (bs*label_size, vocab_size)
-        log_probs = tf.nn.log_softmax(logits, -1)
-
-        label_ids = tf.reshape(label_ids, [-1])
-        label_weights = tf.reshape(label_weights, [-1])
-
-        one_hot_labels = tf.one_hot(
-            label_ids, depth=output_weights.shape[0], dtype=tf.float32)
-
-        # The `positions` tensor might be zero-padded (if the sequence is too
-        # short to have the maximum number of predictions). The `label_weights`
-        # tensor has a value of 1.0 for every real prediction and 0.0 for the
-        # padding predictions.
-        per_example_loss = -tf.reduce_sum(
-            log_probs * one_hot_labels, axis=[-1])
-        numerator = tf.reduce_sum(label_weights * per_example_loss)
-        denominator = tf.reduce_sum(label_weights) + 1e-5
-        loss = numerator / denominator
-
-    return (loss, per_example_loss, log_probs)
 
 
 def get_masked_lm_output_negative_sampling(bert_config, input_tensor,
@@ -493,7 +429,7 @@ def main(_):
     if FLAGS.do_train:
         bert_model, train_op, total_loss = model_fn(features, mode, bert_config, vocab, FLAGS.init_checkpoint,
                                                     FLAGS.learning_rate,
-                                                    FLAGS.num_train_steps, FLAGS.num_warmup_steps, False, False)
+                                                    FLAGS.num_train_steps, FLAGS.num_warmup_steps, False)
         # saver define
         tvars = tf.trainable_variables()
         saver = tf.train.Saver(max_to_keep=30, var_list=tvars)
@@ -546,7 +482,7 @@ def main(_):
 
         bert_model, total_loss = model_fn(features, mode, bert_config, vocab, FLAGS.init_checkpoint,
                                           FLAGS.learning_rate,
-                                          FLAGS.num_train_steps, FLAGS.num_warmup_steps, False, False)
+                                          FLAGS.num_train_steps, FLAGS.num_warmup_steps, False)
 
         # start session
         with tf.Session() as sess:

@@ -1,33 +1,24 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 from tqdm import tqdm
 import pandas as pd
 from research_protocol import split_accounts, write_json, sha256_file
 import os
 import collections
 import random
-# import tensorflow as tf
 import tensorflow.compat.v1 as tf
 tf.disable_v2_behavior()
 
 import numpy as np
-import six
 import pickle as pkl
 import time
 
 flags = tf.flags
 FLAGS = flags.FLAGS
 
-random_seed = 12345
-rng = random.Random(random_seed)
+rng = random.Random()
 
 ## parameters
 flags.DEFINE_integer("max_seq_length", 100, "max sequence length.")
-# flags.DEFINE_integer("sliding_step", 30, "sliding window step size.")
 flags.DEFINE_string("data_dir", './data/', "data dir.")
-flags.DEFINE_string("dataset_name", 'eth',"dataset name.")
 flags.DEFINE_string("vocab_filename", "vocab", "vocab filename")
 flags.DEFINE_bool("total_drop", False, "whether to drop")
 flags.DEFINE_integer("seed", 12345, "Split and window sampling seed")
@@ -54,48 +45,6 @@ class FinetuneInstance(object):
 
         self.io_flags = list(map(map_io_flag, tokens))
         self.cnts = list(map(lambda x: x[5], tokens))
-
-
-    def __str__(self):
-        s = "address: %s\n" % (self.address[0])
-        s += "tokens: %s\n" % (
-            " ".join([printable_text(x) for x in self.tokens]))
-        s += "\n"
-        return s
-
-    def __repr__(self):
-        return self.__str__()
-
-def printable_text(text):
-    """Returns text encoded in a way suitable for print or `tf.logging`."""
-
-    # These functions want `str` for both Python2 and Python3, but in one case
-    # it's a Unicode string and in the other it's a byte string.
-    if six.PY3:
-        if isinstance(text, str):
-            return text
-        elif isinstance(text, bytes):
-            return text.decode("utf-8", "ignore")
-        else:
-            raise ValueError("Unsupported string type: %s" % (type(text)))
-    elif six.PY2:
-        if isinstance(text, str):
-            return text
-        elif isinstance(text, unicode):
-            return text.encode("utf-8")
-        else:
-            raise ValueError("Unsupported string type: %s" % (type(text)))
-    else:
-        raise ValueError("Not running on Python2 or Python 3?")
-
-def create_embedding_predictions(tokens):
-    """Creates the predictions for the masked LM objective."""
-    address = tokens[0][0]
-    output_tokens = tokens
-    masked_lm_positions = []
-    masked_lm_labels = []
-    return (address, output_tokens, masked_lm_positions, masked_lm_labels)
-
 
 def gen_finetune_samples(sequences, label_list):
     instances = []
@@ -200,8 +149,7 @@ def write_finetune_instance_to_example_files(instances, max_seq_length, vocab, o
 
         if inst_index < 3:
             tf.logging.info("*** Example ***")
-            tf.logging.info("tokens: %s" % " ".join(
-                [printable_text(x) for x in instance.tokens]))
+            tf.logging.info("tokens: %s" % " ".join(instance.tokens))
 
             for feature_name in features.keys():
                 feature = features[feature_name]

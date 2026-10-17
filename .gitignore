@@ -27,6 +27,7 @@ Model/eval_output.txt
 
 # Python cache & temp files
 .venv/
+.cache/
 .pytest_cache/
 __pycache__/
 */__pycache__/

@@ -1,16 +1,13 @@
-import pandas as pd
 import os
 import numpy as np
 import pickle as pkl
 from tqdm import tqdm
 import collections
-import functools
 import random
 import tensorflow.compat.v1 as tf
 
 tf.disable_v2_behavior()
 
-import six
 import time
 import math
 from vocab import FreqVocab
@@ -18,8 +15,7 @@ from research_protocol import sha256_file, write_json
 
 tf.logging.set_verbosity(tf.logging.INFO)
 
-random_seed = 12345
-rng = random.Random(random_seed)
+rng = random.Random()
 
 flags = tf.flags
 FLAGS = flags.FLAGS
@@ -33,15 +29,13 @@ flags.DEFINE_bool("do_eval", False,
                   "Diagnostic run only: hold out 20% of accounts from pretraining to measure masked-address "
                   "loss. The resulting encoder never trains on those accounts; use the default (False) "
                   "to pretrain on all accounts for downstream experiments.")
-flags.DEFINE_bool("do_embed", False, "Write an additional unmasked TFRecord")
+flags.DEFINE_bool("do_embed", False,
+                  "Write an unmasked, label-free TFRecord for unsupervised embedding export")
 flags.DEFINE_integer("dupe_factor", 1, "Number of independently masked copies per window")
 flags.DEFINE_string("data_dir", './data/', "data dir.")
 flags.DEFINE_string("vocab_filename", "vocab", "vocab filename")
 flags.DEFINE_bool("total_drop", False, "Use the same repeated-transaction preprocessing as downstream")
 flags.DEFINE_integer("seed", 12345, "Masking, shuffle and window sampling seed")
-
-HEADER = 'hash,nonce,block_hash,block_number,transaction_index,from_address,to_address,value,gas,gas_price,input,block_timestamp,max_fee_per_gas,max_priority_fee_per_gas,transaction_type'.split(
-    ",")
 
 MaskedLmInstance = collections.namedtuple("MaskedLmInstance",
                                           ["index", "label"])
@@ -70,44 +64,6 @@ class TrainingInstance(object):
         self.masked_lm_positions = masked_lm_positions
         self.masked_lm_labels = masked_lm_labels
 
-    def __str__(self):
-        s = "address: %s\n" % (self.address[0])
-        s += "tokens: %s\n" % (
-            " ".join([printable_text(x) for x in self.tokens]))
-        s += "masked_lm_positions: %s\n" % (
-            " ".join([str(x) for x in self.masked_lm_positions]))
-        s += "masked_lm_labels: %s\n" % (
-            " ".join([printable_text(x) for x in self.masked_lm_labels]))
-        s += "\n"
-        return s
-
-    def __repr__(self):
-        return self.__str__()
-
-
-def printable_text(text):
-    """Returns text encoded in a way suitable for print or `tf.logging`."""
-
-    # These functions want `str` for both Python2 and Python3, but in one case
-    # it's a Unicode string and in the other it's a byte string.
-    if six.PY3:
-        if isinstance(text, str):
-            return text
-        elif isinstance(text, bytes):
-            return text.decode("utf-8", "ignore")
-        else:
-            raise ValueError("Unsupported string type: %s" % (type(text)))
-    elif six.PY2:
-        if isinstance(text, str):
-            return text
-        elif isinstance(text, unicode):
-            return text.encode("utf-8")
-        else:
-            raise ValueError("Unsupported string type: %s" % (type(text)))
-    else:
-        raise ValueError("Not running on Python2 or Python 3?")
-
-
 def create_int_feature(values):
     feature = tf.train.Feature(
         int64_list=tf.train.Int64List(value=list(values)))
@@ -125,59 +81,22 @@ def gen_samples(sequences,
                 masked_lm_prob,
                 max_predictions_per_seq,
                 rng,
-                vocab_words,
-                force_head=False):
+                vocab_words):
     instances = []
-    # create train
-    if force_head:
-        for step in range(dupe_factor):
-            start = time.time()
-            for tokens in sequences:
-                (address, tokens, masked_lm_positions,
-                 masked_lm_labels) = create_masked_lm_predictions_force_head(tokens)
-                instance = TrainingInstance(
-                    address=address,
-                    tokens=tokens,
-                    masked_lm_positions=masked_lm_positions,
-                    masked_lm_labels=masked_lm_labels)
-                instances.append(instance)
-            end = time.time()
-            cost = end - start
-            print("step=%d, time=%.2f" % (step, cost))
-        print("=======Finish========")
-
-    else:
-        for step in range(dupe_factor):
-            start = time.time()
-            for tokens in sequences:
-                (address, tokens, masked_lm_positions,
-                 masked_lm_labels) = create_masked_lm_predictions(
-                    tokens, masked_lm_prob, max_predictions_per_seq, rng,
-                    FLAGS.mask_prob, FLAGS.random_token_prob,
-                    FLAGS.mask_self_token, vocab_words=vocab_words)
-                instance = TrainingInstance(
-                    address=address,
-                    tokens=tokens,
-                    masked_lm_positions=masked_lm_positions,
-                    masked_lm_labels=masked_lm_labels)
-                instances.append(instance)
-            end = time.time()
-            cost = end - start
-            print("step=%d, time=%.2f" % (step, cost))
-        print("=======Finish========")
+    for step in range(dupe_factor):
+        start = time.time()
+        for tokens in sequences:
+            address, tokens, masked_lm_positions, masked_lm_labels = create_masked_lm_predictions(
+                tokens, masked_lm_prob, max_predictions_per_seq, rng,
+                FLAGS.mask_prob, FLAGS.random_token_prob,
+                FLAGS.mask_self_token, vocab_words=vocab_words)
+            instances.append(TrainingInstance(
+                address=address, tokens=tokens,
+                masked_lm_positions=masked_lm_positions,
+                masked_lm_labels=masked_lm_labels))
+        print("step=%d, time=%.2f" % (step, time.time() - start))
+    print("=======Finish========")
     return instances
-
-
-def create_masked_lm_predictions_force_head(tokens):
-    """Creates the predictions for the masked LM objective."""
-    first_index = 0
-    address = tokens[0][0]
-    output_tokens = [list(i) for i in tokens]  # note that change the value of output_tokens will also change tokens
-    output_tokens[first_index] = ["[MASK]", 0, 0, 0, 0, 0]
-    masked_lm_positions = [first_index]
-    masked_lm_labels = [tokens[first_index][0]]
-
-    return (address, output_tokens, masked_lm_positions, masked_lm_labels)
 
 
 def create_masked_lm_predictions(tokens, masked_lm_prob,
@@ -340,8 +259,7 @@ def write_instance_to_example_files(instances, max_seq_length,
 
         if inst_index < 3:
             tf.logging.info("*** Example ***")
-            tf.logging.info("tokens: %s" % " ".join(
-                [printable_text(x) for x in instance.tokens]))
+            tf.logging.info("tokens: %s" % " ".join(instance.tokens))
 
             for feature_name in features.keys():
                 feature = features[feature_name]
@@ -377,18 +295,6 @@ def total_repeat_drop(eoa2seq):
         new_eoa2seq[eoa] = new_seq
 
     return new_eoa2seq
-
-
-def cmp_udf_reverse(x1, x2):
-    time1 = int(x1[2])
-    time2 = int(x2[2])
-
-    if time1 < time2:
-        return 1
-    elif time1 > time2:
-        return -1
-    else:
-        return 0
 
 
 def main():
@@ -502,8 +408,7 @@ def main():
                                             masked_lm_prob=FLAGS.masked_lm_prob,
                                             max_predictions_per_seq=max_predictions_per_seq,
                                             rng=rng,
-                                            vocab_words=vocab.vocab_words[3:],
-                                            force_head=False)
+                                            vocab_words=vocab.vocab_words[3:])
 
         eval_write_instance = eval_normal_instances
         rng.shuffle(eval_write_instance)
@@ -527,8 +432,7 @@ def main():
                                    masked_lm_prob=FLAGS.masked_lm_prob,
                                    max_predictions_per_seq=max_predictions_per_seq,
                                    rng=rng,
-                                   vocab_words=vocab.vocab_words[3:],
-                                   force_head=False)
+                                   vocab_words=vocab.vocab_words[3:])
 
     write_instance = normal_instances
     rng.shuffle(write_instance)
