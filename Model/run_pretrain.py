@@ -18,6 +18,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 import os
+import glob
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import sys
 
@@ -35,6 +36,8 @@ import pickle as pkl
 # import time
 from timeit import default_timer as timer
 import math
+import json
+from research_protocol import save_provenance, sha256_file, sha256_files, read_provenance
 
 flags = tf.flags
 FLAGS = flags.FLAGS
@@ -49,7 +52,7 @@ flags.DEFINE_string(
     "This specifies the model architecture.")
 
 flags.DEFINE_string(
-    "train_input_file", "./data/train.tfrecord",
+    "train_input_file", "./data/train*.tfrecord",
     "Input TF example files (can be a glob or comma separated).")
 
 flags.DEFINE_string(
@@ -60,34 +63,40 @@ flags.DEFINE_string(
     "checkpointDir", "ckpt_dir",
     "The output directory where the model checkpoints will be written.")
 
-flags.DEFINE_string("signature", 'default', "signature_name")
-
 ## Other parameters
 flags.DEFINE_string("init_checkpoint", None, "Initial checkpoint (usually from a pre-trained BERT model).")
-flags.DEFINE_integer("max_seq_length", 29, "")
-flags.DEFINE_float("masked_lm_prob", 0.8, "Masked LM probability.")
+flags.DEFINE_integer("max_seq_length", 100, "Must match downstream sequence length")
+flags.DEFINE_float("masked_lm_prob", 0.15, "Fraction of transaction tokens selected for prediction")
 flags.DEFINE_bool("do_train", True, "")
 flags.DEFINE_bool("do_eval", False, "")
 flags.DEFINE_integer("batch_size", 256, "")
-flags.DEFINE_integer("epoch", 5, "")
+flags.DEFINE_integer("epoch", 1, "Number of passes over generated records")
 flags.DEFINE_float("learning_rate", 1e-4, "")
 flags.DEFINE_integer("num_train_steps", 10000000, "Number of training steps.")
 flags.DEFINE_integer("num_warmup_steps", 100, "Number of warmup steps.")
 flags.DEFINE_integer("save_checkpoints_steps", 8000, "")
-flags.DEFINE_integer("iterations_per_loop", 2000, "How many steps to make in each estimator call.")
-flags.DEFINE_integer("max_eval_steps", 1000, "Maximum number of eval steps.")
-flags.DEFINE_integer("neg_sample_num", 5000, "The number of negative samples in a batch")
+flags.DEFINE_integer("neg_sample_num", 512, "The number of negative samples in a batch")
 flags.DEFINE_string("neg_strategy", "zip", "Strategy of negative sampling")
-flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
 flags.DEFINE_string("data_dir", './data/', "data dir.")
 flags.DEFINE_bool("cross_share", True, "whether to share or not")
-flags.DEFINE_bool("load_cross", False, "whether to load from cross")
 flags.DEFINE_string("vocab_filename", "vocab", "vocab filename")
+flags.DEFINE_string("pretrain_manifest", "./data/pretrain_manifest.json", "Pretraining data contract")
+flags.DEFINE_integer("seed", 12345, "NumPy, TensorFlow and shuffle seed")
 
 MAX_PREDICTIONS_PER_SEQ = math.ceil(FLAGS.max_seq_length * FLAGS.masked_lm_prob)
 
 print("MAX_SEQUENCE_LENGTH:", FLAGS.max_seq_length)
 print("MAX_PREDICTIONS_PER_SEQ:", MAX_PREDICTIONS_PER_SEQ)
+
+
+def resolve_input_files(specification):
+    files = []
+    for item in specification.split(","):
+        matches = sorted(glob.glob(item))
+        files.extend(matches if matches else [item])
+    if not files or not all(os.path.isfile(path) for path in files):
+        raise ValueError("Pretraining input does not resolve to existing TFRecord files: " + specification)
+    return files
 
 
 def input_fn(input_files,
@@ -118,12 +127,13 @@ def input_fn(input_files,
             tf.FixedLenFeature([MAX_PREDICTIONS_PER_SEQ], tf.float32)
     }
 
+    input_files = resolve_input_files(input_files)
     if is_training:
-        d = tf.data.TFRecordDataset(input_files)
-        d = d.repeat(FLAGS.epoch).shuffle(100)
+        d = tf.data.TFRecordDataset(input_files, compression_type="GZIP")
+        d = d.repeat(FLAGS.epoch).shuffle(100, seed=FLAGS.seed)
 
     else:
-        d = tf.data.TFRecordDataset(input_files)
+        d = tf.data.TFRecordDataset(input_files, compression_type="GZIP")
 
     d = d.map(lambda record: _decode_record(record, name_to_features), num_parallel_calls=num_cpu_threads)
     d = d.batch(batch_size=FLAGS.batch_size)
@@ -135,7 +145,7 @@ def input_fn(input_files,
 
 
 def model_fn(features, mode, bert_config, vocab, init_checkpoint, learning_rate,
-             num_train_steps, num_warmup_steps, use_tpu, use_one_hot_embeddings):
+             num_train_steps, num_warmup_steps, use_one_hot_embeddings):
     """The `model_fn` for TPUEstimator."""
 
     # tf.logging.info("*** Features ***")
@@ -184,22 +194,16 @@ def model_fn(features, mode, bert_config, vocab, init_checkpoint, learning_rate,
     total_loss = masked_lm_loss
     tvars = tf.trainable_variables()
     initialized_variable_names = {}
-    scaffold_fn = None
 
     if init_checkpoint:
         (assignment_map, initialized_variable_names
          ) = modeling.get_assignment_map_from_checkpoint(
             tvars, init_checkpoint)
-        if use_tpu:
-
-            def tpu_scaffold():
-                tf.train.init_from_checkpoint(init_checkpoint,
-                                              assignment_map)
-                return tf.train.Scaffold()
-
-            scaffold_fn = tpu_scaffold
-        else:
-            tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
+        missing_encoder = [var.name for var in tvars
+                           if var.name.startswith("bert/") and var.name not in initialized_variable_names]
+        if missing_encoder:
+            raise ValueError("Checkpoint did not initialize encoder variables: " + str(missing_encoder[:5]))
+        tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
 
     tf.logging.info("**** Trainable Variables ****")
     for var in tvars:
@@ -212,7 +216,7 @@ def model_fn(features, mode, bert_config, vocab, init_checkpoint, learning_rate,
     if mode == "train":
         train_op = optimization.create_optimizer(total_loss, learning_rate,
                                                  num_train_steps,
-                                                 num_warmup_steps, use_tpu)
+                                                 num_warmup_steps, False)
 
         return model, train_op, total_loss
         # output_spec = tf.estimator.EstimatorSpec(
@@ -222,90 +226,12 @@ def model_fn(features, mode, bert_config, vocab, init_checkpoint, learning_rate,
         #     scaffold=scaffold_fn)
 
     elif mode == "eval":
-
-        def metric_fn(masked_lm_example_loss, masked_lm_log_probs, masked_lm_ids, masked_lm_weights):
-            """Computes the loss and accuracy of the model."""
-            masked_lm_log_probs = tf.reshape(masked_lm_log_probs, [-1, masked_lm_log_probs.shape[-1]])
-            masked_lm_predictions = tf.argmax(masked_lm_log_probs, axis=-1, output_type=tf.int32)
-            masked_lm_example_loss = tf.reshape(masked_lm_example_loss, [-1])
-            masked_lm_ids = tf.reshape(masked_lm_ids, [-1])
-            masked_lm_weights = tf.reshape(masked_lm_weights, [-1])
-            masked_lm_accuracy = tf.metrics.accuracy(labels=masked_lm_ids, predictions=masked_lm_predictions,
-                                                     weights=masked_lm_weights)
-            masked_lm_mean_loss = tf.metrics.mean(values=masked_lm_example_loss, weights=masked_lm_weights)
-
-            return {
-                "masked_lm_accuracy": masked_lm_accuracy,
-                "masked_lm_loss": masked_lm_mean_loss,
-            }
-
-        tf.add_to_collection('eval_sp', masked_lm_log_probs)
-        tf.add_to_collection('eval_sp', input_ids)
-        tf.add_to_collection('eval_sp', masked_lm_ids)
-
-        eval_metrics = metric_fn(masked_lm_example_loss,
-                                 masked_lm_log_probs,
-                                 masked_lm_ids,
-                                 masked_lm_weights)
-
-        # output_spec = tf.estimator.EstimatorSpec(
-        #     mode=mode,
-        #     loss=total_loss,
-        #     eval_metric_ops=eval_metrics,
-        #     scaffold=scaffold_fn)
-
+        # Sampled candidates change each step, so column-zero top-1 is not
+        # full-vocabulary accuracy. Report only corrected sampled loss.
         return model, total_loss
 
     else:
         raise ValueError("Only TRAIN and EVAL modes are supported: %s" % (mode))
-
-
-def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
-                         label_ids, label_weights):
-    """Get loss and log probs for the masked LM."""
-    # [batch_size*label_size, dim]
-    input_tensor = gather_indexes(input_tensor, positions)
-
-    with tf.variable_scope("cls/predictions"):
-        # We apply one more non-linear transformation before the output layer.
-        # This matrix is not used after pre-training.
-        with tf.variable_scope("transform"):
-            input_tensor = tf.layers.dense(
-                input_tensor,
-                units=bert_config.hidden_size,
-                activation=modeling.get_activation(bert_config.hidden_act),
-                kernel_initializer=modeling.create_initializer(
-                    bert_config.initializer_range))
-            input_tensor = modeling.layer_norm(input_tensor)
-
-        # The output weights are the same as the input embeddings, but there is
-        # an output-only bias for each token.
-        output_bias = tf.get_variable(
-            "output_bias",
-            shape=[output_weights.shape[0]],
-            initializer=tf.zeros_initializer())
-        logits = tf.matmul(input_tensor, output_weights, transpose_b=True)
-        logits = tf.nn.bias_add(logits, output_bias)
-        # logits, (bs*label_size, vocab_size)
-        log_probs = tf.nn.log_softmax(logits, -1)
-
-        label_ids = tf.reshape(label_ids, [-1])
-        label_weights = tf.reshape(label_weights, [-1])
-
-        one_hot_labels = tf.one_hot(
-            label_ids, depth=output_weights.shape[0], dtype=tf.float32)
-
-        # The `positions` tensor might be zero-padded (if the sequence is too
-        # short to have the maximum number of predictions). The `label_weights`
-        # tensor has a value of 1.0 for every real prediction and 0.0 for the
-        # padding predictions.
-        per_example_loss = -tf.reduce_sum(
-            log_probs * one_hot_labels, axis=[-1])
-        numerator = tf.reduce_sum(label_weights * per_example_loss)
-        denominator = tf.reduce_sum(label_weights) + 1e-5
-        loss = numerator / denominator
-
-    return (loss, per_example_loss, log_probs)
 
 
 def get_masked_lm_output_negative_sampling(bert_config, input_tensor,
@@ -313,28 +239,38 @@ def get_masked_lm_output_negative_sampling(bert_config, input_tensor,
                                            positions, label_ids, label_weights, vocab):
     """Get loss and log probs for the masked LM."""
 
-    # negative sample randomly
+    # Normal address IDs begin at 4. Candidate samplers use zero-based class
+    # IDs, so convert the actual targets before sampling and map candidates
+    # back to vocabulary IDs for the factorized embedding lookup.
     word_num = len(vocab.vocab_words) - 3
+    flat_label_ids = tf.reshape(label_ids, [-1])
+    true_classes = tf.cast(tf.maximum(flat_label_ids - 4, 0)[:, None], tf.int64)
+    sample_count = min(FLAGS.neg_sample_num, word_num - 1)
+    if sample_count < 1:
+        raise ValueError("Negative sampling requires at least two address tokens")
 
     if FLAGS.neg_strategy == "uniform":
-        neg_ids, _, _ = tf.nn.uniform_candidate_sampler(true_classes=[[0]],
+        sampled_classes, true_expected_count, sampled_expected_count = tf.nn.uniform_candidate_sampler(
+                                                        true_classes=true_classes,
                                                         num_true=1,
-                                                        num_sampled=FLAGS.neg_sample_num,
+                                                        num_sampled=sample_count,
                                                         unique=True,
                                                         range_max=word_num)
 
     elif FLAGS.neg_strategy == "zip":
-        neg_ids, _, _ = tf.nn.log_uniform_candidate_sampler(true_classes=[[0]],
+        sampled_classes, true_expected_count, sampled_expected_count = tf.nn.log_uniform_candidate_sampler(
+                                                            true_classes=true_classes,
                                                             num_true=1,
-                                                            num_sampled=FLAGS.neg_sample_num,
+                                                            num_sampled=sample_count,
                                                             unique=True,
                                                             range_max=word_num)
 
     elif FLAGS.neg_strategy == "freq":
         # negative sample based on frequency
-        neg_ids, _, _ = tf.nn.fixed_unigram_candidate_sampler(true_classes=[[0]],
+        sampled_classes, true_expected_count, sampled_expected_count = tf.nn.fixed_unigram_candidate_sampler(
+                                                              true_classes=true_classes,
                                                               num_true=1,
-                                                              num_sampled=FLAGS.neg_sample_num,
+                                                              num_sampled=sample_count,
                                                               unique=True,
                                                               range_max=word_num,
                                                               unigrams=list(
@@ -344,8 +280,8 @@ def get_masked_lm_output_negative_sampling(bert_config, input_tensor,
     else:
         raise ValueError("Please select correct negative sampling strategy: uniform, zip, .")
 
-    neg_ids = tf.cast(neg_ids, tf.int32)
-    neg_ids = neg_ids + 1 + 3 # + 4 (1 padding, 2 mask, 3 not use)
+    sampled_class_ids = sampled_classes
+    neg_ids = tf.cast(sampled_class_ids, tf.int32) + 4
 
     # [batch_size*label_size, dim]
     input_tensor = gather_indexes(input_tensor, positions)
@@ -362,7 +298,6 @@ def get_masked_lm_output_negative_sampling(bert_config, input_tensor,
                     bert_config.initializer_range))
             input_tensor = modeling.layer_norm(input_tensor)
 
-        # label_ids = tf.reshape(label_ids, [-1])
         label_weights = tf.reshape(label_weights, [-1])
 
         pos_output_weights = modeling.new_embedding_lookup(label_ids,
@@ -380,19 +315,21 @@ def get_masked_lm_output_negative_sampling(bert_config, input_tensor,
 
         neg_output_weights = tf.reshape(neg_output_weights, [-1, neg_output_weights.shape[-1]])
 
-        pos_logits = tf.reduce_sum(tf.multiply(input_tensor, pos_output_weights), axis=-1)  # 768
+        pos_logits = tf.reduce_sum(tf.multiply(input_tensor, pos_output_weights), axis=-1)
+        # Correct for the non-uniform proposal distribution. Without this,
+        # frequent addresses are systematically penalized.
+        pos_logits -= tf.math.log(tf.maximum(tf.reshape(true_expected_count, [-1]), 1e-10))
         pos_logits = tf.expand_dims(pos_logits, axis=1)
-        neg_logits = tf.matmul(input_tensor, neg_output_weights, transpose_b=True)  # 768, 10000
+        neg_logits = tf.matmul(input_tensor, neg_output_weights, transpose_b=True)
+        neg_logits -= tf.math.log(tf.maximum(sampled_expected_count[None, :], 1e-10))
+
+        # A sampled candidate equal to the row's true token is not a negative.
+        accidental_hits = tf.equal(true_classes, sampled_class_ids[None, :])
+        neg_logits = tf.where(accidental_hits,
+                              tf.fill(tf.shape(neg_logits), tf.constant(-1e9, tf.float32)),
+                              neg_logits)
 
         logits = tf.concat([pos_logits, neg_logits], axis=1)
-        # The output weights are the same as the input embeddings, but there is
-        # an output-only bias for each token.
-        output_bias = tf.get_variable(
-            "output_bias",
-            shape=[logits.shape[1]],
-            initializer=tf.zeros_initializer())
-
-        logits = tf.nn.bias_add(logits, output_bias)
         log_probs = tf.nn.log_softmax(logits, -1)
         per_example_loss = -log_probs[:, 0]
         # The `positions` tensor might be zero-padded (if the sequence is too
@@ -436,17 +373,14 @@ def _decode_record(record, name_to_features):
 
 
 def main(_):
+    np.random.seed(FLAGS.seed)
+    tf.set_random_seed(FLAGS.seed)
     if FLAGS.do_train:
         mode = "train"
         input_files = FLAGS.train_input_file
-        # load data
-        features = input_fn(input_files, is_training=True)
-
     elif FLAGS.do_eval:
         mode = "eval"
         input_files = FLAGS.test_input_file
-        features = input_fn(input_files, is_training=False)
-
     else:
         raise ValueError("Only TRAIN and EVAL modes are supported.")
 
@@ -458,11 +392,56 @@ def main(_):
     vocab_file_name = FLAGS.data_dir + FLAGS.vocab_filename
     with open(vocab_file_name, "rb") as f:
         vocab = pkl.load(f)
+    with open(FLAGS.pretrain_manifest, encoding="utf-8") as source:
+        data_manifest = json.load(source)
+    expected_hash = data_manifest["train_sha256"] if FLAGS.do_train else data_manifest["validation_sha256"]
+    if expected_hash is None:
+        raise ValueError("No diagnostic holdout exists in this pretraining data. "
+                         "Regenerate it with gen_pretrain_data.py --do_eval=True (diagnostic runs only).")
+    if expected_hash != sha256_files(resolve_input_files(input_files)):
+        raise ValueError("Pretraining TFRecord does not match its manifest")
+    if data_manifest["max_seq_length"] != FLAGS.max_seq_length:
+        raise ValueError("Pretraining sequence length differs from its data manifest")
+    if max(vocab.id_to_tokens) >= bert_config.vocab_size:
+        raise ValueError("Vocabulary IDs exceed configured embedding coverage")
+    if FLAGS.init_checkpoint:
+        parent = read_provenance(FLAGS.init_checkpoint)
+        if parent.get("verified") and (parent["config_sha256"] != sha256_file(FLAGS.bert_config_file)
+                                      or parent["vocab_sha256"] != sha256_file(vocab_file_name)):
+            raise ValueError("Initial checkpoint config or vocabulary mismatch")
+
+    # Validate the protocol and input contract before constructing a dataset, so a
+    # diagnostic-only evaluation request reports its actual error even when the
+    # holdout file was never generated.
+    features = input_fn(input_files, is_training=FLAGS.do_train)
+
+    def save_checkpoint(sess, saver, step):
+        if step <= 0:
+            raise ValueError("Pretraining input contained no records")
+        prefix = saver.save(sess, os.path.join(FLAGS.checkpointDir, "model_" + str(step)))
+        save_provenance(prefix, "masked_address_prediction", FLAGS.bert_config_file,
+                        vocab_file_name, parent=FLAGS.init_checkpoint,
+                        seed=FLAGS.seed, steps=step, cross_share=FLAGS.cross_share,
+                        evaluation_setting="transductive",
+                        diagnostic_holdout=data_manifest.get("diagnostic_holdout", False),
+                        trained_on_all_accounts=data_manifest.get("train_covers_all_accounts", False),
+                        max_seq_length=data_manifest["max_seq_length"],
+                        total_drop=data_manifest["total_drop"],
+                        masked_lm_probability=data_manifest["masked_lm_probability"],
+                        mask_probability=data_manifest["mask_probability"],
+                        random_token_probability=data_manifest["random_token_probability"],
+                        mask_self_token=data_manifest["mask_self_token"],
+                        negative_sampling_strategy=FLAGS.neg_strategy,
+                        negative_sample_count=min(FLAGS.neg_sample_num, len(vocab.vocab_words) - 4),
+                        sampled_softmax_log_q_correction=True,
+                        accidental_hits_removed=True,
+                        position_specific_output_bias=False,
+                        training_input_sha256=sha256_files(resolve_input_files(FLAGS.train_input_file)))
 
     if FLAGS.do_train:
         bert_model, train_op, total_loss = model_fn(features, mode, bert_config, vocab, FLAGS.init_checkpoint,
                                                     FLAGS.learning_rate,
-                                                    FLAGS.num_train_steps, FLAGS.num_warmup_steps, False, False)
+                                                    FLAGS.num_train_steps, FLAGS.num_warmup_steps, False)
         # saver define
         tvars = tf.trainable_variables()
         saver = tf.train.Saver(max_to_keep=30, var_list=tvars)
@@ -480,6 +459,8 @@ def main(_):
             while True:
                 try:
                     _, loss = sess.run([train_op, total_loss])
+                    if not np.isfinite(loss):
+                        raise ValueError("Non-finite pretraining loss")
                     # loss = sess.run([total_loss])
                     losses.append(loss)
 
@@ -493,18 +474,18 @@ def main(_):
                         start = timer()
 
                     if iter % FLAGS.save_checkpoints_steps == 0 and iter > 0:
-                        saver.save(sess, os.path.join(FLAGS.checkpointDir, "model_" + str(round(iter))))
+                        save_checkpoint(sess, saver, iter + 1)
 
                     iter += 1
 
                 except tf.errors.OutOfRangeError:
                     print("Out of Sequence, end of training...")
                     # save model
-                    saver.save(sess, os.path.join(FLAGS.checkpointDir, "model_" + str(round(iter))))
+                    save_checkpoint(sess, saver, iter)
                     break
                 except Exception as e:
                     print("Unexpected error:", e)
-                    break
+                    raise
 
     elif FLAGS.do_eval:
         # must have checkpoint
@@ -513,7 +494,7 @@ def main(_):
 
         bert_model, total_loss = model_fn(features, mode, bert_config, vocab, FLAGS.init_checkpoint,
                                           FLAGS.learning_rate,
-                                          FLAGS.num_train_steps, FLAGS.num_warmup_steps, False, False)
+                                          FLAGS.num_train_steps, FLAGS.num_warmup_steps, False)
 
         # start session
         with tf.Session() as sess:
@@ -535,12 +516,14 @@ def main(_):
                         start = timer()
                     iter += 1
 
-                except Exception as e:
+                except tf.errors.OutOfRangeError:
                     print("Out of Sequence")
                     # save model
                     # saver.save(sess, os.path.join(FLAGS.checkpointDir, "model_" + str(iter)))
                     break
 
+            if not losses:
+                raise ValueError("Evaluation input contained no records")
             final_loss = np.mean(losses)
             eval_sample_num = len(losses)
 

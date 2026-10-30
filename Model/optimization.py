@@ -25,7 +25,7 @@ tf.disable_v2_behavior()
 
 
 def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps,
-                     use_tpu):
+                     use_tpu, var_list=None):
     """Creates an optimizer training op."""
     global_step = tf.train.get_or_create_global_step()
 
@@ -70,7 +70,7 @@ def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps,
     if use_tpu:
         optimizer = tf.contrib.tpu.CrossShardOptimizer(optimizer)
 
-    tvars = tf.trainable_variables()
+    tvars = tf.trainable_variables() if var_list is None else var_list
     grads = tf.gradients(loss, tvars)
 
     # This is how the model was pre-trained.

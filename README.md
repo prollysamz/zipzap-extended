@@ -1,128 +1,166 @@
 # LLM Applications in Finance: Ethereum Fraud Detection
 
-This repository contains the replication code for detecting Ethereum fraud using a language model approach, based on the ZipZap paper architecture. 
+ZipZap replication and a controlled foundation for studying label-scarce Ethereum phishing detection. The original TensorFlow v1 graph architecture is retained through `tensorflow.compat.v1`.
 
-## Requirements
-* Python >= 3.6
-* TensorFlow
-* tf-keras (Required for legacy Keras layer compatibility)
-* NumPy
-* Pandas
-* Scikit-Learn
+## Current status
+
+The code fixes corrupted amount features, count-bucket boundaries, address-embedding bucket gaps, singleton batches, the sampled pretraining objective, and errors previously treated as successful completion. It adds account-level validation, validation-only threshold selection, ranking metrics, pretrained and random frozen-encoder controls, full fine-tuning, a behavioural-feature control, three anomaly detectors, checkpoint provenance, and account embedding export.
+
+**No new benchmark results are claimed.** The dataset and checkpoints are distributed separately and are not in this repository. Historical results must be rerun after regenerating data and retraining with the corrected configuration. AUC is threshold-independent; a classification threshold does not determine AUC.
+
+## Environment
+
+Python 3.11 is the verified runtime. Create a virtual environment, then install:
 
 ```bash
-pip install tensorflow tf-keras numpy pandas scikit-learn
+python -m pip install -r requirements-dev.txt
+python -m pytest tests -q
 ```
 
-## How to run the Pre-trained Evaluation Locally
+The TensorFlow flow tests use a tiny synthetic dataset, run actual pretraining and both supervised modes, and check checkpoint restoration, frozen weights, amount features, split coverage, embedding extraction, and failure paths. They do not establish real-world detection performance.
 
-If you have been sent the pre-trained weights (`ckpt_dir`) and test dataset (`data`) separately (they are not tracked in GitHub due to file size limits), follow these steps to evaluate the model on your machine:
+## Data and configurations
 
-### 1. Place the files in the correct directories
-Extract the provided files directly into the `Model/` directory so the folder structure looks exactly like this:
-
-```
-ZipZap-main/
-└── Model/
-    ├── ckpt_dir/
-    │   ├── bert_finetune.data-00000-of-00001
-    │   ├── bert_finetune.index
-    │   ├── bert_finetune.meta
-    │   └── checkpoint
-    ├── data/
-    │   ├── finetune_test.tfrecord
-    │   └── vocab
-    ├── run_finetune.py
-    └── ...
-```
-
-### 2. Run the evaluation script
-Navigate into the `Model` directory and execute the evaluation command. 
-
-> **Important note:** You must include `--load_cross=False` when running the evaluation, otherwise the script will attempt to search for a shared layer that was deactivated during our standard pre-training.
+Place the raw dataset in `Data/` and run commands from `Model/`. The raw filenames expected by `gen_seq.py` remain unchanged. The paper authors publish the archive from their [official ZipZap repository](https://github.com/git-disl/ZipZap); its `Data/` directory includes a phishing address list, but the label-free workflow below never reads it.
 
 ```bash
 cd Model
-python run_finetune.py --do_train=False --do_eval=True --init_checkpoint=ckpt_dir/bert_finetune --load_cross=False
+python gen_seq.py --dataset=1M --phisher=False
+python gen_pretrain_data.py --do_embed=True --seed=12345
+python partitioning.py --vocab=data/vocab --config=zipzap_config.json --output-config=data/zipzap_config.json
+python run_pretrain.py --bert_config_file=data/zipzap_config.json --checkpointDir=ckpt_pretrain --seed=12345
 ```
 
-### 3. Understanding the output
-The script will loop through the `finetune_test.tfrecord` dataset. Once it reaches the end of the sequence, it will print out the final Area Under the Curve (AUC) metric and classification reports for various thresholds (0.05 to 0.95). 
+This is the primary unsupervised workflow: it excludes the phishing transaction files, never opens `phisher_account.txt`, and fits only the masked-address objective. The generator writes unmasked, label-free gzip TFRecord shards such as `data/embed-00000-of-00014.tfrecord`. Export their account embeddings and fit an anomaly detector without labels:
 
-A standard threshold of `0.5` should yield an AUC of **~0.9766**.
-
-## Reproducing from the raw dataset on Windows
-
-The supplied `Dataset/Dataset.gz` archive contains raw transaction CSV files, not the pre-generated TFRecords or trained checkpoints described above. Extract it at the repository root so that the CSV files are under `Data/`.
-
-Create the pinned Python environment:
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```bash
+python extract_embeddings.py --checkpoint=ckpt_pretrain/model_STEP --config=data/zipzap_config.json --input-file='data/embed-*.tfrecord' --output=project_results/unlabelled_embeddings.npz
+python anomaly_detection.py --train=project_results/unlabelled_embeddings.npz --method=isolation_forest --output-dir=project_results/isolation_forest
 ```
 
-Generate sequences, vocabulary, and TFRecords:
+The official archive currently provides the paper's 1M normal-transaction slice, so the command uses `--dataset=1M`. Use `--dataset=10M` only when the corresponding 10M slice files are available. The detector scores the same all-account corpus by default and chooses its alert threshold from the training-score percentile. It does not read or write labels. Use a separate, explicitly reported evaluation experiment only when you deliberately create labelled account splits.
 
-```powershell
-.\run_local.ps1 -Stage prepare
+The fine-tuning generator creates a stratified 70/15/15 account split **before assigning windows** and writes:
+
+- `data/finetune_train.tfrecord`
+- `data/finetune_validation.tfrecord`
+- `data/finetune_test.tfrecord`
+- `data/finetune_splits.json`, containing account IDs, record counts, file/vocabulary hashes, seed, and preprocessing metadata.
+
+Stratification uses known phishing labels. It must be disclosed as label-informed benchmark construction, even when downstream fitting uses no labels. The negative class means accounts without known phishing labels, not verified legitimate accounts. Small datasets without sufficient examples in both classes fail stratified splitting explicitly.
+
+`zipzap_config.json` uses corrected contiguous half-open embedding buckets. **Its embedding table shapes differ from historical checkpoints.** Use it for new training. `zipzap_config.legacy.json` preserves the original ranges and explicitly permits their gaps for historical evaluation only. Do not load old weights with the corrected configuration or compare corrected runs as though they reproduce the old preprocessing.
+
+Vocabulary IDs depend on the actual dataset. Generate a matching configuration with `python partitioning.py --vocab=data/vocab --config=zipzap_config.json --output-config=data/zipzap_config.json`, then pass that output to training and extraction. The final upper bound is exclusive and `vocab_size` exceeds the maximum ID. Keep one factor dimension per bucket and the first factor dimension equal to `hidden_size` for this architecture.
+
+Pretraining and downstream generation now both default to 100-token windows with repeat dropping disabled. This trains every learned position used downstream and keeps the sequence policy aligned. Both manifests record those settings, and checkpoint loading rejects a mismatch. `gen_seq.py` still aggregates repeated counterparties into three-day groups before bucketization. It saves a pre-bucket copy for the behavioural control, but this is already aggregated data and must not be described as untouched raw transactions.
+
+## Pretraining and provenance
+
+```bash
+python run_pretrain.py --checkpointDir=ckpt_pretrain --seed=12345
+python inspect_checkpoint.py ckpt_pretrain/model_STEP
 ```
 
-Then pre-train and fine-tune:
+The sampled loss uses each masked token's real vocabulary ID, removes accidental true-token negatives, subtracts log sampling probabilities, and has no positive-column bias. The default is 512 negatives rather than 5,000. Masking excludes the account self token and uses 80% `[MASK]`, 10% random-token, and 10% unchanged replacement. By default `gen_pretrain_data.py` pretrains on **all accounts** and writes no holdout, which is the setting for every downstream experiment. A masked-address loss on unseen accounts is available only as a separate diagnostic run: `python gen_pretrain_data.py --do_eval=True --data_dir=data_diag/` holds out 20% of accounts (split by account before windowing, so overlapping windows cannot cross the boundary) and writes `test.tfrecord` and `pretrain_split.json`; pass the same `--data_dir`, `--train_input_file`, `--test_input_file` and `--pretrain_manifest` to `run_pretrain.py`, then evaluate with `--do_train=False --do_eval=True`. A diagnostic encoder never trains on the held-out accounts, so their own-ID embeddings stay essentially untrained; its checkpoint provenance records `diagnostic_holdout: true` (inherited by fine-tuned descendants), and `extract_embeddings.py` refuses it unless `--allow-diagnostic-checkpoint` marks the export as a separate ablation. Do not mix diagnostic checkpoints with all-account checkpoints in one comparison. Evaluation reports the corrected sampled loss; it does not report the old candidate-column accuracy.
 
-```powershell
-.\run_local.ps1 -Stage pretrain
-.\run_local.ps1 -Stage finetune -Checkpoint ckpt_dir/model_64000
+Replace `model_STEP` with an actual checkpoint prefix. Each newly saved checkpoint has a `.provenance.json` sidecar recording its objective and preprocessing, encoder label use, parent checkpoint, seed, architecture sharing, config/vocabulary hashes, and checkpoint shard hashes. Resuming pretraining from a supervised encoder retains supervised ancestry. The sidecar is an auditable record, not tamper-proof enforcement; retain training logs and dataset hashes with it.
+
+The existing preprocessing builds the vocabulary and self-supervised training pool before the downstream account split, including accounts used later for evaluation. All current experiments are therefore **transductive**. The raw collection also explicitly adds known phishing accounts; this is not an untouched naturally sampled unlabelled population. No temporal or unseen-account generalization claim is supported. The vocabulary has no learned unknown-address policy; an inductive experiment needs separate preprocessing, time cutoffs, and an explicit address policy.
+
+## Supervised baselines
+
+Train and evaluate the full fine-tuned reference:
+
+```bash
+python run_finetune.py --init_checkpoint=ckpt_pretrain --checkpointDir=ckpt_finetuned --output_dir=project_results/finetuned --seed=12345
 ```
 
-To evaluate a separately supplied fine-tuned checkpoint:
+Train the MLP on frozen pretrained representations using the same data and encoder architecture:
 
-```powershell
-.\run_local.ps1 -Stage evaluate -Checkpoint ckpt_dir/bert_finetune
+```bash
+python run_finetune.py --init_checkpoint=ckpt_pretrain --freeze_encoder=True --checkpointDir=ckpt_frozen --output_dir=project_results/frozen --seed=12345
 ```
 
-The paper used an NVIDIA RTX 3090 with 24 GB of GPU memory. Full preprocessing and training are compute-intensive; CPU-only execution is supported by TensorFlow but is not expected to reproduce the paper's training time. The raw archive does not include `Model/ckpt_dir`, so pre-trained evaluation cannot run until those checkpoint files are supplied or a model is trained locally.
+Run the matching random frozen-encoder control by omitting the checkpoint:
 
-### WSL2 GPU execution
+```bash
+python run_finetune.py --freeze_encoder=True --checkpointDir=ckpt_random_frozen --output_dir=project_results/random_frozen --seed=12345
+```
 
-TensorFlow 2.11 and newer do not support CUDA on native Windows. The included `requirements.txt` therefore installs the CPU package on Windows and the official `tensorflow[and-cuda]` extra on Linux/WSL.
+A directory passed as `--init_checkpoint` resolves to its latest checkpoint. Keep pretrained and supervised output directories separate. Pretraining defaults to shared layers; downstream training defaults to independent layers initialized from those shared weights (`--load_cross=True`). For an unshared source checkpoint use `--load_cross=False`. Frozen mode disables encoder dropout, stops gradients, and restricts optimizer variables to the MLP.
 
-This machine is configured with Python 3.11 and its environment at `/home/jakku/.venvs/llmfa` inside the `Ubuntu-24.04` WSL2 distribution. Verify GPU access from PowerShell:
+Evaluation selects the threshold maximizing account-level validation F1 and reads the test file only after that threshold is fixed. Scores are averaged across an account's windows. The frozen MLP reference operates on window representations before averaging probabilities; the exporter below instead averages window embeddings. For a strict account-vector detector comparison, train the supervised head on those same exported vectors or apply every detector per window with the same score aggregation. Do not attribute an aggregation difference to detector choice. The split manifest checks file hashes, record counts, exact account coverage, and disjoint account sets. Unexpected errors propagate; partial evaluations do not produce successful metrics.
+
+`metrics.json` includes Average Precision (AP), ROC-AUC, Precision@K, Recall@K, precision, recall, F1, confusion counts, false positives per 1,000 evaluated accounts, timing, provenance, and threshold label use. AP uses scikit-learn's average-precision definition, not trapezoidal PR area. K is `ceil(account_count * alert_fraction)` with `--alert_fraction=0.01` by default. Tied rankings use account ID order. Inference timing includes graph construction, checkpoint loading, scoring, and aggregation, so report that convention. Scores are exported to `test_scores.npz` with stable account IDs.
+
+Repeat runs with several `--seed` values and distinct output directories; report variability. Keep the same split manifest across model seeds to measure training variability independently of split variability. Regenerating splits with different seeds is a separate experiment.
+
+## Existing supplied checkpoints
+
+Historical files can be placed in `Model/ckpt_dir/` and `Model/data/`. If only the old test TFRecord is available, use a threshold declared in advance; this cannot reproduce an unbiased validation-selected F1 without validation data:
+
+```bash
+python run_finetune.py --do_train=False --init_checkpoint=ckpt_dir/bert_finetune --load_cross=False --bert_config_file=zipzap_config.legacy.json --split_manifest= --threshold_protocol=fixed --fixed_threshold=0.5 --output_dir=project_results/legacy
+```
+
+This explicit legacy mode reports unverified split coverage and unknown checkpoint provenance if no manifest exists. Evaluation-only opens no training input. Do not use a historical test threshold sweep to select a new threshold. Historical amount corruption remains embedded in already generated records and learned weights; changing the writer does not repair them.
+
+## Frozen embedding export
+
+Export mean-pooled transaction representations from a verified pretrained encoder:
+
+```bash
+python extract_embeddings.py --checkpoint=ckpt_pretrain/model_STEP --input-file=data/finetune_train.tfrecord --split=train --output=project_results/train_embeddings.npz
+```
+
+Repeat with the validation and test files and matching `--split` values. Mean pooling excludes the account self token and padding, avoiding the self-ID lookup shortcut. Windows are combined in proportion to their transaction counts. `--l2-normalize` optionally normalizes final account vectors; the anomaly runner always fits its scaler on training data only. The NPZ stores account IDs, embeddings, and evaluation labels; extraction does not use labels to compute representations. Downstream unsupervised fitting must not consume the exported labels. Labels remain available for separately identified supervised baselines and evaluation.
+
+The export sidecar records checkpoint ancestry, pooling, window aggregation, split hash, output hash, sequence preprocessing, and extraction time. Supervised or unknown encoders are rejected by default. `--allow-supervised-or-unknown` explicitly permits a separately identified ablation and does not mark its representations label-independent. All split exports for a comparison must use the same checkpoint, pooling, preprocessing, and split manifest.
+
+## Behavioural and unsupervised baselines
+
+Build account-level behavioural features from the pre-bucket aggregate and train the supervised tree control:
+
+```bash
+python extract_behavioral_features.py --output-dir=project_results/behavioral_features
+python supervised_feature_baseline.py --train=project_results/behavioral_features/train.npz --validation=project_results/behavioral_features/validation.npz --test=project_results/behavioral_features/test.npz --output-dir=project_results/behavioral
+```
+
+Run an actual anomaly detector without labels on the unlabelled export:
+
+```bash
+python anomaly_detection.py --train=project_results/unlabelled_embeddings.npz --method=isolation_forest --output-dir=project_results/isolation_forest
+```
+
+`--method` also accepts `kmeans` and `autoencoder`. Scaling, optional PCA, and optional L2 normalization are fitted on training vectors only. The default mixed-unlabelled mode and percentile threshold do not load labels. `--setting=one_class`, `--threshold=validation_f1`, and `--test` deliberately consume labelled exports and are separately recorded evaluation modes.
+
+The benchmark is positive-unlabelled: class 0 means “no known phishing label,” not verified legitimate. Accordingly, reported false positives are flags among accounts without known labels, and must not be presented as proven false accusations. Future claims still require repeated seeds, contamination sensitivity, and a temporal or unseen-account protocol with an unknown-address policy.
+
+## Windows and WSL historical replication helper
+
+The repository also retains the PowerShell workflow used to reproduce the
+historical paper implementation from the supplied raw CSV archive. This path is
+separate from the corrected label-free research workflow above and should not
+be used to claim results from the corrected protocol. The helper deliberately
+calls `run_pretrain_legacy.py`, `run_finetune_legacy.py`, and
+`zipzap_config.legacy.json`; the primary scripts remain reserved for the
+corrected, manifest-verified workflow.
+
+Native Windows TensorFlow is CPU-only for current releases. For NVIDIA GPU
+execution, create the Python environment in WSL2 and run from PowerShell:
 
 ```powershell
 .\run_wsl.ps1 -Stage gpu
-```
-
-Run preparation and training from PowerShell:
-
-```powershell
-.\run_wsl.ps1 -Stage prepare
-.\run_wsl.ps1 -Stage pretrain -BatchSize 32
+.\run_wsl.ps1 -Stage prepare -RebuildData
+.\run_wsl.ps1 -Stage pretrain -BatchSize 256
 .\run_wsl.ps1 -Stage finetune -BatchSize 32 -Checkpoint ckpt_dir/model_64000
-```
-
-The WSL preparation stage uses a disk-backed DuckDB transformation and streams
-TFRecords without retaining the complete transaction graph or duplicated
-training instances in RAM. Its database and generated data are stored under
-`/home/jakku/llmfa-prep` and `/home/jakku/llmfa-data`, where substantially more
-disk space is available than on the Windows drive. Add `-RebuildData` only when
-the source CSVs or preparation logic have changed.
-
-The default WSL batch size is 32 to fit an 8 GB RTX 4070 Laptop GPU. Reduce it further if TensorFlow reports an out-of-memory error.
-
-### Stage 2 anomaly detection
-
-Export the same 64-dimensional first-token representation consumed by the
-supervised MLP, then compare Isolation Forest, K-Means distance and a compact
-autoencoder:
-
-```powershell
-.\run_wsl.ps1 -Stage extract -Checkpoint ckpt_dir/bert_finetune -BatchSize 64
+.\run_wsl.ps1 -Stage extract -BatchSize 64 -Checkpoint ckpt_dir/bert_finetune
 .\run_wsl.ps1 -Stage anomaly
 ```
 
-Add `-CrossShare` when extracting from a pretraining checkpoint containing the
-shared-layer encoder. Reports are written under
-`/home/jakku/llmfa-anomaly-results`, and per-account scores are retained for
-error analysis. Thresholds are selected on a validation subset of the training
-accounts, not on the held-out test set.
+`prepare_streaming.py` uses a disk-backed DuckDB transformation and writes
+TFRecords incrementally, avoiding the original all-in-memory transaction graph
+and duplicated-instance lists. Its default WSL working locations are
+`/home/jakku/llmfa-prep` and `/home/jakku/llmfa-data`. The anomaly helper writes
+results under `/home/jakku/llmfa-anomaly-results`.

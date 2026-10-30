@@ -1,9 +1,9 @@
-tensorflow==2.15.1; platform_system == "Windows"
-tensorflow[and-cuda]==2.15.1; platform_system == "Linux"
-tf-keras==2.15.1
-numpy<2
-pandas<3
-scikit-learn<2
-tqdm<5
-six<2
-duckdb<2
+# Verified on Python 3.11; the model uses TensorFlow's v1 graph API.
+tensorflow==2.18.1
+tf-keras==2.18.0
+numpy==2.0.2
+pandas==2.3.3
+scikit-learn==1.7.2
+tqdm==4.67.1
+six==1.17.0
+duckdb==1.4.2

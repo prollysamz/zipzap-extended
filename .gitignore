@@ -10,6 +10,8 @@ Model/data/
 # Model checkpoints & weights
 Model/ckpt_dir/
 ckpt_dir/
+ckpt_pretrain/
+ckpt_*/
 *.ckpt*
 *.index
 *.meta
@@ -22,7 +24,6 @@ Model/eval_output.txt
 *.log
 *.txt
 !requirements.txt
-
 # Local source material supplied alongside the repository
 /Research Paper.pdf
 
@@ -31,6 +32,9 @@ Model/eval_output.txt
 Model/anomaly_data/
 Model/anomaly_results/
 .codex-doc-review-*/
+!requirements-dev.txt
+.cache/
+.pytest_cache/
 __pycache__/
 */__pycache__/
 *.py[cod]
