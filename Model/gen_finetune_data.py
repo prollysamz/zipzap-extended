@@ -174,7 +174,7 @@ def write_finetune_instance_to_example_files(instances, max_seq_length, vocab, o
         address = vocab.convert_tokens_to_ids(instance.address)
         counts = instance.cnts
         block_timestamps = instance.block_timestamps
-        values = instance.cnts
+        values = instance.values
         io_flags = instance.io_flags
         positions = convert_timestamp_to_position(block_timestamps)
         label = [instance.label]

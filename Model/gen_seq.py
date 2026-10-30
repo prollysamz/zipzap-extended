@@ -219,7 +219,7 @@ def feature_bucketization(eoa2seq_agg):
                 cnt_bucket = 6
             elif cnt == 7:
                 cnt_bucket = 7
-            elif 8 < cnt <= 10:
+            elif 8 <= cnt <= 10:
                 cnt_bucket = 8
             elif 10 < cnt <= 20:
                 cnt_bucket = 9

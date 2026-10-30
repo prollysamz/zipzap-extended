@@ -1,6 +1,7 @@
 # Data directories & files
 Data/
 data/
+Dataset/
 Model/data/
 *.csv
 *.tar.gz
@@ -20,8 +21,16 @@ project_results/
 Model/eval_output.txt
 *.log
 *.txt
+!requirements.txt
+
+# Local source material supplied alongside the repository
+/Research Paper.pdf
 
 # Python cache & temp files
+.venv/
+Model/anomaly_data/
+Model/anomaly_results/
+.codex-doc-review-*/
 __pycache__/
 */__pycache__/
 *.py[cod]
