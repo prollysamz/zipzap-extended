@@ -422,7 +422,7 @@ def main(_):
         save_provenance(prefix, "masked_address_prediction", FLAGS.bert_config_file,
                         vocab_file_name, parent=FLAGS.init_checkpoint,
                         seed=FLAGS.seed, steps=step, cross_share=FLAGS.cross_share,
-                        evaluation_setting="transductive",
+                        evaluation_setting=data_manifest.get("evaluation_setting", "transductive"),
                         diagnostic_holdout=data_manifest.get("diagnostic_holdout", False),
                         trained_on_all_accounts=data_manifest.get("train_covers_all_accounts", False),
                         max_seq_length=data_manifest["max_seq_length"],

@@ -137,6 +137,36 @@ python anomaly_detection.py --train=project_results/unlabelled_embeddings.npz --
 
 The benchmark is positive-unlabelled: class 0 means “no known phishing label,” not verified legitimate. Accordingly, reported false positives are flags among accounts without known labels, and must not be presented as proven false accusations. Future claims still require repeated seeds, contamination sensitivity, and a temporal or unseen-account protocol with an unknown-address policy.
 
+## Inductive, continually updated experiment
+
+This tests the live-data claim: pretrain only on history before a cutoff, then score accounts first seen afterwards, and compare a frozen period-0 model with one that keeps pretraining as new data arrives. Everything is label-free except the final evaluation.
+
+```bash
+cd Model
+python run_temporal_experiment.py --stage data --source-dir data_benchmark
+python run_temporal_experiment.py --stage pretrain --epochs 5
+python run_temporal_experiment.py --stage embed
+python run_temporal_experiment.py --stage score
+python run_temporal_experiment.py --stage report
+```
+
+`--cutoffs` defaults to `2019-01-01,2020-01-01,2021-01-01,2022-01-01`. Results go to `project_results/temporal/temporal_comparison.md`.
+
+- **Vocabulary is fixed from period 0.** Addresses unseen in period 0, or seen fewer than `--min-token-count` (default 2) times, map to the unknown token (`[NO_USE]`, id 3). The account's own token is always the unknown token, so scores depend on behaviour and counterparties, not on a memorised account ID. This differs from the original ZipZap self-ID design and from the transductive workflows above.
+- **Update step.** Period k continues masked-address pretraining from the previous checkpoint (learning rate `--update-lr`, default 5e-5) on windows that contain activity newer than the previous cutoff. Embedding rows for addresses first seen after period 0 do not exist, so updates adapt the transformer and known-address rows only. A vocabulary refresh that grows the embedding table is not implemented.
+- **Evaluation.** For period k, "static" is the period-0 model and "updated" is the model that has trained through period k-1. Both fit each detector on their own reference accounts (everything seen by their cutoff) and score the accounts first seen in period k. Accounts first seen earlier but only reaching five transactions later are in neither set. Labels (`labels.npz`) are read only to compute metrics. Known phishing accounts were also present, unlabelled, in the pretraining data, so negatives are still "no known label".
+- Smoke test: add `--limit-accounts 6000 --epochs 1 --batch-size 64 --data-dir ... --ckpt-dir ... --output-dir ...` with scratch directories; its metrics are meaningless.
+
+## Moving to live data
+
+Offline slices are a replay of what a deployment does, so the path to live data reuses the same pieces:
+
+1. **Ingest.** Pull recent transactions for an account set (an archive node, an indexer or a provider API such as Etherscan, Alchemy or BigQuery's public Ethereum dataset) and write them in the raw CSV layout `gen_seq.py` reads, or adapt `load_data`. Keep all of its preprocessing: the three-day merge, the value scaling, the five-transaction minimum and the same bucket boundaries.
+2. **Score new accounts.** Rebuild each account's latest 100-transaction window, map unseen addresses and the self token to the unknown token (`temporal_data.anonymise`), export embeddings with `extract_embeddings.py`, and score with the saved detector (`model.joblib`). Take the alert threshold from the training-score percentile, not from labels.
+3. **Update on a schedule.** Each week or month, build windows with `windows(..., newer_than=last_cutoff)`, continue pretraining from the latest checkpoint at a low learning rate, then refit the detector on fresh reference embeddings. Keep every checkpoint and its provenance file so you can roll back.
+4. **Know when it has drifted.** Track the masked-address loss on new data, the share of tokens mapped to unknown, and the score distribution. A rising unknown share means the vocabulary is stale and needs a rebuild and a full retrain.
+5. **Evidence still needs labels.** Alerts on live data have no ground truth. Review a sample of alerts by hand, or use later-published phishing lists as delayed labels, and report the precision from that sample.
+
 ## Windows and WSL runner
 
 `run_wsl.ps1` supports both workflows. The legacy stages below reproduce the
