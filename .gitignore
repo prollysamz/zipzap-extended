@@ -3,7 +3,9 @@ Data/
 data/
 Dataset/
 Model/data/
+Model/data_benchmark/
 *.csv
+!benchmark_comparison.csv
 *.tar.gz
 *.zip
 

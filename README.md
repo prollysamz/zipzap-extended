@@ -137,15 +137,13 @@ python anomaly_detection.py --train=project_results/unlabelled_embeddings.npz --
 
 The benchmark is positive-unlabelled: class 0 means “no known phishing label,” not verified legitimate. Accordingly, reported false positives are flags among accounts without known labels, and must not be presented as proven false accusations. Future claims still require repeated seeds, contamination sensitivity, and a temporal or unseen-account protocol with an unknown-address policy.
 
-## Windows and WSL historical replication helper
+## Windows and WSL runner
 
-The repository also retains the PowerShell workflow used to reproduce the
-historical paper implementation from the supplied raw CSV archive. This path is
-separate from the corrected label-free research workflow above and should not
-be used to claim results from the corrected protocol. The helper deliberately
-calls `run_pretrain_legacy.py`, `run_finetune_legacy.py`, and
-`zipzap_config.legacy.json`; the primary scripts remain reserved for the
-corrected, manifest-verified workflow.
+`run_wsl.ps1` supports both workflows. The legacy stages below reproduce the
+historical paper implementation from the supplied raw CSV archive. They remain
+separate from the corrected protocol and deliberately call
+`run_pretrain_legacy.py`, `run_finetune_legacy.py`, and
+`zipzap_config.legacy.json`.
 
 Native Windows TensorFlow is CPU-only for current releases. For NVIDIA GPU
 execution, create the Python environment in WSL2 and run from PowerShell:
@@ -158,6 +156,49 @@ execution, create the Python environment in WSL2 and run from PowerShell:
 .\run_wsl.ps1 -Stage extract -BatchSize 64 -Checkpoint ckpt_dir/bert_finetune
 .\run_wsl.ps1 -Stage anomaly
 ```
+
+For the corrected label-free workflow, run the stages in order. The data stage
+excludes phishing files and writes `Model/data` artifacts; partitioning then
+creates the vocabulary-matched corrected configuration. Pretraining explicitly
+uses that config and `pretrain_manifest.json`; export reads the unlabelled
+embedding shards without a split manifest; anomaly fitting uses neither labels
+nor label-informed settings.
+
+```powershell
+.\run_wsl.ps1 -Stage label-free-data -Dataset 1M -Seed 12345
+.\run_wsl.ps1 -Stage label-free-partition
+.\run_wsl.ps1 -Stage label-free-pretrain -BatchSize 256 -Seed 12345
+.\run_wsl.ps1 -Stage label-free-extract -BatchSize 64 -Checkpoint ckpt_pretrain/model_STEP
+.\run_wsl.ps1 -Stage label-free-anomaly -Method isolation_forest -Seed 12345
+```
+
+`label-free-extract` writes `project_results/unlabelled_embeddings.npz` and
+`label-free-anomaly` writes under `project_results/<method>`. `-Dataset 10M`
+requires the corresponding raw slice files. The pretraining stage defaults to
+`ckpt_pretrain`; pass that checkpoint prefix to the export stage after training.
+
+For a same-corpus supervised-versus-unsupervised benchmark, use the isolated
+benchmark stages. This corpus includes the phishing transaction files, but the
+pretraining objective and mixed-unlabelled anomaly detectors do not read their
+labels. Labels are used to construct the declared account splits, train the
+supervised controls, and evaluate the held-out test set. Benchmark artifacts are
+kept under `data_benchmark`, `ckpt_benchmark_*`, and
+`project_results/benchmark`, separate from the primary label-free workflow.
+
+```powershell
+.\run_wsl.ps1 -Stage benchmark-data -Dataset 1M -Seed 12345
+.\run_wsl.ps1 -Stage benchmark-pretrain -BatchSize 256 -Seed 12345
+.\run_wsl.ps1 -Stage benchmark-supervised -BatchSize 256 -Checkpoint ckpt_benchmark_pretrain/model_STEP
+.\run_wsl.ps1 -Stage benchmark-export -BatchSize 256 -Checkpoint ckpt_benchmark_pretrain/model_STEP
+.\run_wsl.ps1 -Stage benchmark-anomaly -Method isolation_forest -Seed 12345
+.\run_wsl.ps1 -Stage benchmark-anomaly -Method kmeans -Seed 12345
+.\run_wsl.ps1 -Stage benchmark-anomaly -Method autoencoder -Seed 12345
+```
+
+Run `python compare_benchmark.py` from `Model/` after all six corrected model
+metrics exist. It writes `comparison.csv`, `comparison.json`, and
+`comparison.md`. Any original supervised result is included only as a legacy
+reference and is marked as not belonging to the same corrected benchmark.
 
 `prepare_streaming.py` uses a disk-backed DuckDB transformation and writes
 TFRecords incrementally, avoiding the original all-in-memory transaction graph

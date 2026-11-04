@@ -9,6 +9,7 @@ FLAGS = flags.FLAGS
 
 flags.DEFINE_bool("phisher", True, "whether to include phisher detection dataset.")
 flags.DEFINE_string("data_dir", "../Data", "data directory.")
+flags.DEFINE_string("output_dir", "./data", "directory for generated sequence pickles")
 flags.DEFINE_string("dataset", "1M", "which dataset to use")
 flags.DEFINE_bool("dup", True, "whether to do transaction duplication")
 
@@ -243,10 +244,10 @@ def main():
 
         eoa2seq_agg.update(phisher_eoa2seq_agg)
 
-    tf.gfile.MakeDirs("./data")
+    tf.gfile.MakeDirs(FLAGS.output_dir)
     # Preserve continuous amounts and repetition counts for the behavioural
     # control before the Transformer-specific bucketization mutates them.
-    with open("./data/eoa2seq_behavioral.pkl", "wb") as f:
+    with open(os.path.join(FLAGS.output_dir, "eoa2seq_behavioral.pkl"), "wb") as f:
         pkl.dump(eoa2seq_agg, f)
 
     eoa2seq_agg = feature_bucketization(eoa2seq_agg)
@@ -262,7 +263,7 @@ def main():
     print("Mean:", np.mean(length_list))
     print("Seq #:", len(length_list))
 
-    with open("./data/eoa2seq.pkl", "wb") as f:
+    with open(os.path.join(FLAGS.output_dir, "eoa2seq.pkl"), "wb") as f:
         pkl.dump(eoa2seq_agg, f)
 
 
