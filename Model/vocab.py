@@ -20,6 +20,11 @@ class FreqVocab(object):
             self.counter[eoa] = len(seq)
             self.counter.update(map(lambda x:x[0], seq))
 
+    def prune(self, min_count):
+        """Drop tokens seen fewer than `min_count` times; callers map them to an unknown token."""
+        for token in [t for t, count in self.counter.items() if count < min_count]:
+            del self.counter[token]
+
     def generate_vocab(self):
         self.token_count = len(self.counter.keys())
         self.special_tokens = ["[MASK]", "[pad]", '[NO_USE]']

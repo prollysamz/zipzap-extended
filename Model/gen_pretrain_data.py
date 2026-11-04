@@ -154,13 +154,14 @@ def gen_samples(sequences,
 def create_masked_lm_predictions(tokens, masked_lm_prob,
                                  max_predictions_per_seq, rng,
                                  mask_prob=0.8, random_token_prob=0.1,
-                                 mask_self_token=False, vocab_words=None):
+                                 mask_self_token=False, vocab_words=None, exclude_tokens=()):
     """Creates the predictions for the masked LM objective."""
 
     address = tokens[0][0]
     if mask_prob < 0 or random_token_prob < 0 or mask_prob + random_token_prob > 1:
         raise ValueError("Replacement probabilities must be nonnegative and sum to at most one")
-    cand_indexes = list(range(0 if mask_self_token else 1, len(tokens)))
+    cand_indexes = [i for i in range(0 if mask_self_token else 1, len(tokens))
+                    if tokens[i][0] not in exclude_tokens]
     if not cand_indexes:
         raise ValueError("Sequence has no transaction token available for masking")
 
@@ -240,8 +241,11 @@ def convert_timestamp_to_position(block_timestamps):
 
 def write_instance_to_example_files(instances, max_seq_length,
                                     max_predictions_per_seq, vocab,
-                                    output_files):
-    """Create TF example files from `TrainingInstance`s."""
+                                    output_files, address_ids=None):
+    """Create TF example files from `TrainingInstance`s.
+
+    `address_ids` optionally supplies one record key per instance; the temporal workflow uses it
+    because accounts outside the vocabulary share a single unknown token."""
     writers = []
     records_by_file = [0] * len(output_files)
     for output_file in output_files:
@@ -253,7 +257,8 @@ def write_instance_to_example_files(instances, max_seq_length,
     for inst_index in tqdm(range(len(instances))):
         instance = instances[inst_index]
         input_ids = vocab.convert_tokens_to_ids(instance.tokens)
-        address = vocab.convert_tokens_to_ids(instance.address)
+        address = [address_ids[inst_index]] if address_ids is not None \
+            else vocab.convert_tokens_to_ids(instance.address)
         counts = instance.cnts
         block_timestamps = instance.block_timestamps
         values = instance.values
